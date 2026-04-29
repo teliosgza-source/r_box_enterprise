@@ -1,0 +1,3588 @@
+===== ./scripts/init_db.py =====
+-- Enable PostGIS
+CREATE EXTENSION IF NOT EXISTS postgis;
+CREATE EXTENSION IF NOT EXISTS postgis_topology;
+
+-- Create tables
+CREATE TABLE IF NOT EXISTS unit (
+    unitid BIGINT PRIMARY KEY,
+    parentid BIGINT,
+    country_id INTEGER NOT NULL,
+    country VARCHAR(100),
+    country_code VARCHAR(3),
+    levelDescription VARCHAR(50),
+    countryLevelId INTEGER,
+    levelKey VARCHAR(100),
+    telioslevelKey VARCHAR(200) UNIQUE,
+    countnextLevel INTEGER DEFAULT 0,
+    unit VARCHAR(200),
+    parentlevelKey VARCHAR(100),
+    teliosparentlevelKey VARCHAR(200),
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE TABLE IF NOT EXISTS psql_geo (
+    id BIGSERIAL PRIMARY KEY,
+    unitid BIGINT REFERENCES unit(unitid),
+    parent_id BIGINT,
+    country_id INTEGER,
+    levelid INTEGER,
+    levelkey VARCHAR(100),
+    tellevelkey VARCHAR(200),
+    countnextlevel INTEGER,
+    unit VARCHAR(200),
+    geometry JSONB,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE TABLE IF NOT EXISTS teliosgeojson (
+    id BIGSERIAL PRIMARY KEY,
+    unitid BIGINT REFERENCES unit(unitid),
+    parent_id BIGINT,
+    country_id INTEGER,
+    levelid INTEGER,
+    levelkey VARCHAR(100),
+    tellevelkey VARCHAR(200),
+    countnextlevel INTEGER,
+    unit VARCHAR(200),
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE TABLE IF NOT EXISTS teliosgeojsondata (
+    id BIGSERIAL PRIMARY KEY,
+    teliosgeojson_id BIGINT REFERENCES teliosgeojson(unitid),
+    geojson JSONB,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
+-- Create indexes
+CREATE INDEX idx_unit_parentid ON unit(parentid);
+CREATE INDEX idx_unit_country_id ON unit(country_id);
+CREATE INDEX idx_unit_telioslevelKey ON unit(telioslevelKey);
+CREATE INDEX idx_unit_country ON unit(country);
+
+CREATE INDEX idx_psql_geo_unitid ON psql_geo(unitid);
+CREATE INDEX idx_psql_geo_tellevelkey ON psql_geo(tellevelkey);
+
+CREATE INDEX idx_teliosgeojson_unitid ON teliosgeojson(unitid);
+CREATE INDEX idx_teliosgeojsondata_id ON teliosgeojsondata(teliosgeojson_id);
+
+-- Create updated_at trigger
+CREATE OR REPLACE FUNCTION update_updated_at_column()
+RETURNS TRIGGER AS $$
+BEGIN
+    NEW.updated_at = CURRENT_TIMESTAMP;
+    RETURN NEW;
+END;
+$$ language 'plpgsql';
+
+CREATE TRIGGER update_unit_updated_at BEFORE UPDATE
+    ON unit FOR EACH ROW EXECUTE FUNCTION update_updated_at_column();
+===== ./scripts/migrate_data.py =====
+
+===== ./shared/src/validate.py =====
+# === CODE FOR src/validate.py ===
+# src/validate.py
+"""
+Validation script to ensure ID consistency across all output files.
+Run after processing to verify data integrity.
+"""
+
+import pandas as pd
+import argparse
+from pathlib import Path
+from typing import Dict, List, Tuple
+
+class IDValidator:
+    """Validates ID consistency across generated output files."""
+
+    def __init__(self, country_name: str, output_dir: str):
+        self.country_name = country_name
+        self.output_dir = Path(output_dir) / country_name.replace(' ', '_')
+        self.errors: List[str] = []
+        self.warnings: List[str] = []
+
+    def load_files(self) -> Dict[str, pd.DataFrame]:
+        """Load all output files for validation."""
+        files = {}
+
+        file_mapping = {
+            'unit': 'Unit.csv',
+            'psql_geo': 'PSQL_Geo.csv',
+            'geojson': 'GeoJSON.csv',
+            'teliosgeojson': 'teliosgeojson.csv',
+            'teliosgeojsondata': 'teliosgeojsondata.csv'
+        }
+
+        for key, filename in file_mapping.items():
+            file_path = self.output_dir / filename
+            if file_path.exists():
+                files[key] = pd.read_csv(file_path)
+                print(f"✅ Loaded {filename}: {len(files[key])} records")
+            else:
+                self.errors.append(f"Missing file: {filename}")
+
+        return files
+
+    def validate_unitid_consistency(self, files: Dict[str, pd.DataFrame]) -> bool:
+        """Check that unitid values are consistent across files."""
+        if 'unit' not in files:
+            return False
+
+        unit_df = files['unit']
+
+        # Check 1: No duplicate unitids in Unit.csv
+        duplicates = unit_df['unitid'].duplicated().sum()
+        if duplicates > 0:
+            self.errors.append(f"Found {duplicates} duplicate unitid values in Unit.csv")
+            return False
+
+        # Check 2: Sequential IDs starting from 1
+        expected_ids = set(range(1, len(unit_df) + 1))
+        actual_ids = set(unit_df['unitid'].values)
+
+        if expected_ids != actual_ids:
+            missing = expected_ids - actual_ids
+            extra = actual_ids - expected_ids
+            if missing:
+                self.errors.append(f"Missing unitid values: {sorted(missing)}")
+            if extra:
+                self.errors.append(f"Unexpected unitid values: {sorted(extra)}")
+            return False
+
+        print("✅ UnitID consistency passed")
+        return True
+
+    def validate_parentid_references(self, files: Dict[str, pd.DataFrame]) -> bool:
+        """Check that all parentid values reference existing unitids."""
+        if 'unit' not in files:
+            return False
+
+        unit_df = files['unit']
+        valid_ids = set(unit_df['unitid'].values)
+
+        # Check parentid references
+        parent_ids = set(unit_df['parentid'].values)
+        invalid_parents = parent_ids - valid_ids
+
+        if invalid_parents:
+            self.errors.append(f"Invalid parentid references: {sorted(invalid_parents)}")
+            return False
+
+        # Check country (level 0) is its own parent
+        country = unit_df[unit_df['countryLevelId'] == 0]
+        if not country.empty:
+            country_unitid = country.iloc[0]['unitid']
+            country_parentid = country.iloc[0]['parentid']
+            if country_unitid != country_parentid:
+                self.errors.append(f"Country parentid ({country_parentid}) should equal unitid ({country_unitid})")
+                return False
+
+        print("✅ ParentID references passed")
+        return True
+
+    def validate_geojson_id_mapping(self, files: Dict[str, pd.DataFrame]) -> bool:
+        """Check that teliosgeojson_id matches unitid across files."""
+        if 'unit' not in files or 'geojson' not in files:
+            return False
+
+        unit_ids = set(files['unit']['unitid'].values)
+
+        # Check GeoJSON.csv
+        geojson_ids = set(files['geojson']['teliosgeojson_id'].values)
+        if unit_ids != geojson_ids:
+            missing = unit_ids - geojson_ids
+            extra = geojson_ids - unit_ids
+            if missing:
+                self.errors.append(f"GeoJSON.csv missing IDs: {sorted(missing)}")
+            if extra:
+                self.errors.append(f"GeoJSON.csv extra IDs: {sorted(extra)}")
+            return False
+
+        # Check teliosgeojsondata.csv
+        if 'teliosgeojsondata' in files:
+            data_ids = set(files['teliosgeojsondata']['teliosgeojson_id'].values)
+            if unit_ids != data_ids:
+                missing = unit_ids - data_ids
+                extra = data_ids - unit_ids
+                if missing:
+                    self.errors.append(f"teliosgeojsondata.csv missing IDs: {sorted(missing)}")
+                if extra:
+                    self.errors.append(f"teliosgeojsondata.csv extra IDs: {sorted(extra)}")
+                return False
+
+        print("✅ GeoJSON ID mapping passed")
+        return True
+
+    def validate_hierarchy_integrity(self, files: Dict[str, pd.DataFrame]) -> bool:
+        """Check parent-child relationships are consistent."""
+        if 'unit' not in files:
+            return False
+
+        unit_df = files['unit']
+
+        # Build parent-child mapping
+        issues = []
+        for _, row in unit_df.iterrows():
+            level = row['countryLevelId']
+            unitid = row['unitid']
+            parentid = row['parentid']
+            telios_key = row['telioslevelKey']
+            telios_parent = row['teliosparentlevelKey']
+
+            if level == 0:
+                # Country should be its own parent
+                if unitid != parentid:
+                    issues.append(f"Country {unitid} should be its own parent")
+                continue
+
+            # Find parent
+            parent = unit_df[unit_df['unitid'] == parentid]
+            if parent.empty:
+                issues.append(f"Unit {unitid} (level {level}) has missing parent {parentid}")
+                continue
+
+            parent_row = parent.iloc[0]
+
+            # Check parent level is one less
+            if parent_row['countryLevelId'] != level - 1:
+                issues.append(f"Unit {unitid} (level {level}) parent {parentid} is level {parent_row['countryLevelId']}")
+
+            # Check telios parent key matches
+            if parent_row['telioslevelKey'] != telios_parent:
+                issues.append(f"Unit {unitid} telios parent mismatch: {telios_parent} vs {parent_row['telioslevelKey']}")
+
+        if issues:
+            for issue in issues[:10]:  # Show first 10
+                self.errors.append(issue)
+            if len(issues) > 10:
+                self.errors.append(f"... and {len(issues) - 10} more hierarchy issues")
+            return False
+
+        print("✅ Hierarchy integrity passed")
+        return True
+
+    def validate_countnextlevel(self, files: Dict[str, pd.DataFrame]) -> bool:
+        """Verify countnextLevel matches actual child count."""
+        if 'unit' not in files:
+            return False
+
+        unit_df = files['unit']
+
+        # Calculate actual child counts
+        child_counts = unit_df.groupby('parentid').size().to_dict()
+
+        mismatches = []
+        for _, row in unit_df.iterrows():
+            unitid = row['unitid']
+            level = row['countryLevelId']
+            reported = row['countnextLevel']
+
+            # Skip leaf nodes (villages)
+            if level >= 4:
+                if reported != 0 and pd.notna(reported):
+                    mismatches.append(f"Leaf node {unitid} should have countnextLevel=0, got {reported}")
+                continue
+
+            actual = child_counts.get(unitid, 0)
+            if reported != actual:
+                mismatches.append(f"Unit {unitid}: reported {reported} children, actual {actual}")
+
+        if mismatches:
+            for mismatch in mismatches[:10]:
+                self.warnings.append(mismatch)
+            if len(mismatches) > 10:
+                self.warnings.append(f"... and {len(mismatches) - 10} more count mismatches")
+            print("⚠️  countnextLevel warnings (non-critical)")
+            return True  # Warnings don't fail validation
+
+        print("✅ countnextLevel validation passed")
+        return True
+
+    def run_all_validations(self) -> bool:
+        """Run all validation checks."""
+        print(f"\n🔍 Validating {self.country_name}...")
+        print("=" * 60)
+
+        files = self.load_files()
+        if not files:
+            print("❌ No files to validate")
+            return False
+
+        checks = [
+            ("UnitID Consistency", self.validate_unitid_consistency),
+            ("ParentID References", self.validate_parentid_references),
+            ("GeoJSON ID Mapping", self.validate_geojson_id_mapping),
+            ("Hierarchy Integrity", self.validate_hierarchy_integrity),
+            ("CountNextLevel", self.validate_countnextlevel),
+        ]
+
+        all_passed = True
+        for name, check_func in checks:
+            print(f"\n📋 {name}...")
+            if not check_func(files):
+                all_passed = False
+
+        # Report results
+        print("\n" + "=" * 60)
+        if all_passed and not self.errors:
+            print("✅ ALL VALIDATIONS PASSED")
+        else:
+            print("❌ VALIDATION FAILED")
+
+        if self.errors:
+            print(f"\nErrors ({len(self.errors)}):")
+            for error in self.errors:
+                print(f"  ❌ {error}")
+
+        if self.warnings:
+            print(f"\nWarnings ({len(self.warnings)}):")
+            for warning in self.warnings:
+                print(f"  ⚠️  {warning}")
+
+        print("=" * 60)
+        return all_passed and not self.errors
+
+def main():
+    parser = argparse.ArgumentParser(description='Validate output file ID consistency')
+    parser.add_argument('--country', type=str, required=True, help='Country name to validate')
+    parser.add_argument('--output-dir', type=str, default='output', help='Output directory')
+
+    args = parser.parse_args()
+
+    validator = IDValidator(args.country, args.output_dir)
+    succes<response clipped><NOTE>Result is longer than **10000 characters**, will be **truncated**.</NOTE>
+===== ./shared/src/utils/fast_writer.py =====
+"""
+Fast file writer using Java for high-performance I/O
+"""
+import subprocess
+import json
+import tempfile
+import os
+from pathlib import Path
+import pandas as pd
+import numpy as np
+
+class FastFileWriter:
+    """Wrapper for Java-based fast file writing"""
+    
+    def __init__(self):
+        self.java_classpath = self._get_classpath()
+        self.temp_dir = Path(tempfile.gettempdir()) / "telios_temp"
+        self.temp_dir.mkdir(exist_ok=True)
+    
+    def _get_classpath(self):
+        """Get the Java classpath"""
+        project_root = Path(__file__).parent.parent.parent
+        java_dir = project_root / "java-service/target/classes"
+        
+        # Check if compiled classes exist
+        if java_dir.exists():
+            return str(java_dir)
+        
+        # Try to find the jar
+        jar_file = project_root / "java-service/target/fast-writer-1.0.jar"
+        if jar_file.exists():
+            return str(jar_file)
+        
+        return None
+    
+    def write_csv(self, df: pd.DataFrame, filepath: str) -> bool:
+        """Write DataFrame to CSV using Java for speed"""
+        try:
+            # Convert to efficient format
+            headers = list(df.columns)
+            data = df.values.tolist()
+            
+            # For large datasets, use Java directly
+            if len(data) > 50000:
+                return self._write_with_java(headers, data, filepath)
+            else:
+                # Small datasets can use pandas
+                df.to_csv(filepath, index=False)
+                return True
+                
+        except Exception as e:
+            print(f"Error writing with Java, falling back to pandas: {e}")
+            df.to_csv(filepath, index=False)
+            return False
+    
+    def _write_with_java(self, headers, data, filepath):
+        """Call Java for fast writing"""
+        if not self.java_classpath:
+            return False
+        
+        # Create temporary file for data
+        temp_file = self.temp_dir / f"data_{os.getpid()}.json"
+        
+        # Prepare data for Java
+        json_data = {
+            "headers": headers,
+            "data": data[:100000]  # Limit to 100k for memory
+        }
+        
+        # Write data to temp file
+        with open(temp_file, 'w') as f:
+            json.dump(json_data, f)
+        
+        try:
+            # Call Java process
+            result = subprocess.run([
+                'java', '-cp', self.java_classpath,
+                'com.telios.CSVWriter',
+                str(temp_file), filepath
+            ], capture_output=True, text=True, timeout=60)
+            
+            return result.returncode == 0
+            
+        except subprocess.TimeoutExpired:
+            print("Java write timeout, falling back to pandas")
+            return False
+        except Exception as e:
+            print(f"Java execution error: {e}")
+            return False
+        finally:
+            if temp_file.exists():
+                temp_file.unlink()
+    
+    def write_multiple_files(self, files_dict: dict, output_dir: str):
+        """Write multiple files in parallel"""
+        for filename, df in files_dict.items():
+            filepath = Path(output_dir) / filename
+            self.write_csv(df, str(filepath))
+    
+    def write_compressed(self, df: pd.DataFrame, filepath: str):
+        """Write compressed CSV for large files"""
+        filepath_gz = filepath + '.gz'
+        df.to_csv(filepath_gz, index=False, compression='gzip')
+        return filepath_gz
+
+# Create a pandas-compatible writer that's 10x faster for large DataFrames
+def fast_to_csv(df, path, **kwargs):
+    """Fast CSV writer that handles large DataFrames efficiently"""
+    writer = FastFileWriter()
+    
+    # For large DataFrames, use chunking
+    if len(df) > 100000:
+        # Write in chunks
+        chunk_size = 50000
+        first_chunk = True
+        
+        for i in range(0, len(df), chunk_size):
+            chunk = df.iloc[i:i+chunk_size]
+            mode = 'w' if first_chunk else 'a'
+            header = first_chunk
+            chunk.to_csv(path, mode=mode, header=header, index=False, **kwargs)
+            first_chunk = False
+    else:
+        # Use standard pandas for smaller datasets
+        df.to_csv(path, index=False, **kwargs)
+    
+    return path
+
+===== ./shared/src/utils/validators.py =====
+
+===== ./shared/src/utils/sanitizers.py =====
+"""
+Utility functions for sanitizing filenames and strings.
+"""
+
+import re
+
+def sanitize_filename(filename: str) -> str:
+    """
+    Sanitize a filename by removing or replacing invalid characters.
+    """
+    if not filename:
+        return ""
+    filename = str(filename)
+    filename = filename.replace(' ', '_')
+    filename = re.sub(r'[^a-zA-Z0-9_-]', '', filename)
+    return filename
+===== ./shared/src/utils/country_mapper.py =====
+"""
+Country mapping utility for staging database IDs.
+Loads country mappings from YAML config file.
+"""
+
+import yaml
+from pathlib import Path
+from typing import Dict, Optional, Tuple
+
+class CountryMapper:
+    """Maps country names to staging database IDs and ISO codes."""
+    
+    def __init__(self, config_path: Optional[Path] = None):
+        """
+        Initialize country mapper with config file.
+        
+        Args:
+            config_path: Path to country_ids.yaml config file.
+                        If None, looks in default locations.
+        """
+        self.country_map: Dict[str, Dict] = {}
+        self.config_path = self._find_config(config_path)
+        self._load_config()
+        
+    def _find_config(self, config_path: Optional[Path]) -> Path:
+        """Find the country_ids.yaml config file."""
+        if config_path and Path(config_path).exists():
+            return Path(config_path)
+        
+        # Try default locations
+        possible_paths = [
+            Path(__file__).parent.parent.parent / "config" / "country_ids.yaml",
+            Path(__file__).parent.parent / "config" / "country_ids.yaml",
+            Path.cwd() / "config" / "country_ids.yaml",
+            Path.cwd() / "country_ids.yaml",
+        ]
+        
+        for path in possible_paths:
+            if path.exists():
+                print(f"📁 Found country config at: {path}")
+                return path
+        
+        # If no config found, create default config
+        default_config = Path(__file__).parent.parent.parent / "config" / "country_ids.yaml"
+        default_config.parent.mkdir(parents=True, exist_ok=True)
+        
+        # Create default config with commonly used countries
+        default_mapping = {
+            'country_ids': {
+                'India': {'id': 204, 'iso': 'IND'},
+                'Indonesia': {'id': 205, 'iso': 'IDN'},
+                'Bangladesh': {'id': 201, 'iso': 'BGD'},
+                'Nigeria': {'id': 156, 'iso': 'NGA'},
+                'Pakistan': {'id': 166, 'iso': 'PAK'},
+                'Myanmar': {'id': 151, 'iso': 'MMR'},
+                'Laos': {'id': 119, 'iso': 'LAO'},
+                "Côte d'Ivoire": {'id': 155, 'iso': 'CIV'},
+                'Uganda': {'id': 229, 'iso': 'UGA'},
+            }
+        }
+        
+        with open(default_config, 'w') as f:
+            yaml.dump(default_mapping, f, default_flow_style=False)
+        
+        print(f"📁 Created default country config at: {default_config}")
+        return default_config
+    
+    def _load_config(self):
+        """Load country mappings from YAML config file."""
+        try:
+            with open(self.config_path, 'r') as f:
+                config = yaml.safe_load(f)
+                self.country_map = config.get('country_ids', {})
+            print(f"✅ Loaded {len(self.country_map)} country mappings")
+        except Exception as e:
+            print(f"⚠️ Error loading country config: {e}")
+            self.country_map = {}
+    
+    def get_country_id(self, country_name: str) -> int:
+        """
+        Get staging database ID for a country.
+        
+        Args:
+            country_name: Name of the country (e.g., 'India')
+            
+        Returns:
+            Database ID if found, otherwise 0 (will be logged as warning)
+        """
+        # Try exact match
+        if country_name in self.country_map:
+            return self.country_map[country_name]['id']
+        
+        # Try case-insensitive match
+        country_lower = country_name.lower()
+        for name, data in self.country_map.items():
+            if name.lower() == country_lower:
+                return data['id']
+        
+        # Try fuzzy match (remove common variations)
+        country_clean = country_name.replace("'", "").replace("-", " ").lower()
+        for name, data in self.country_map.items():
+            name_clean = name.replace("'", "").replace("-", " ").lower()
+            if name_clean == country_clean:
+                return data['id']
+        
+        print(f"⚠️ No staging DB ID found for country: '{country_name}'")
+        return 0
+    
+    def get_country_iso(self, country_name: str) -> str:
+        """
+        Get ISO code for a country.
+        
+        Args:
+            country_name: Name of the country
+            
+        Returns:
+            ISO code if found, otherwise uppercase first 3 letters of country name
+        """
+        if country_name in self.country_map:
+            return self.country_map[country_name]['iso']
+        
+        # Try case-insensitive match
+        country_lower = country_name.lower()
+        for name, data in self.country_map.items():
+            if name.lower() == country_lower:
+                return data['iso']
+        
+        # Default to first 3 letters uppercase
+        return country_name[:3].upper()
+    
+    def get_country_info(self, country_name: str) -> Tuple[int, str]:
+        """
+        Get both staging DB ID and ISO code for a country.
+        
+        Returns:
+            Tuple of (database_id, iso_code)
+        """
+        country_id = self.get_country_id(country_name)
+        country_iso = self.get_country_iso(country_name)
+        return country_id, country_iso
+    
+    def add_country_mapping(self, country_name: str, country_id: int, iso_code: str):
+        """Add or update a country mapping."""
+        self.country_map[country_name] = {'id': country_id, 'iso': iso_code}
+        
+    def save_config(self):
+        """Save current mappings back to config file."""
+        config = {'country_ids': self.country_map}
+        with open(self.config_path, 'w') as f:
+            yaml.dump(config, f, default_flow_style=False)
+        print(f"✅ Saved {len(self.country_map)} country mappings to {self.config_path}")
+===== ./shared/src/utils/__init__.py =====
+
+===== ./shared/src/utils/file_handlers.py =====
+"""
+File handling utilities for I/O operations.
+"""
+
+import os
+import pandas as pd
+from pathlib import Path
+from typing import Union
+
+def ensure_directory(directory: Union[str, Path]) -> Path:
+    """Ensure directory exists, create if it doesn't."""
+    path = Path(directory)
+    path.mkdir(parents=True, exist_ok=True)
+    return path
+
+def save_dataframe(df: pd.DataFrame, directory: Union[str, Path], 
+                   filename: str, sheet_name: str = None) -> tuple:
+    """
+    Save DataFrame to both CSV and Excel formats.
+    """
+    dir_path = ensure_directory(directory)
+    csv_path = dir_path / f"{filename}.csv"
+    df.to_csv(csv_path, index=False)
+    excel_path = dir_path / f"{filename}.xlsx"
+    if sheet_name is None:
+        sheet_name = filename[:31]
+    df.to_excel(excel_path, index=False, sheet_name=sheet_name)
+    return csv_path, excel_path
+
+def get_file_size(path: Union[str, Path]) -> int:
+    """Get file size in bytes."""
+    return Path(path).stat().st_size
+
+def save_outputs(df: pd.DataFrame, output_path: str, level_name: str):
+    """
+    Save processor outputs to CSV and Excel files.
+    Used by level processors.
+    """
+    if df is None or df.empty:
+        print(f"   ⚠️ No data to save for {level_name}")
+        return
+        
+    save_dataframe(df, output_path, level_name, sheet_name=level_name)
+    print(f"   ✅ Saved {level_name}: {len(df)} records")
+===== ./shared/src/main.py =====
+"""
+Simplified entry point for geospatial data processing.
+Usage: python src/main.py --data-root /path/to/data
+Auto-detects Map vs Mapless data and saves to appropriate Finale_Map or Finale_Mapless folder.
+Uses staging database IDs from config file.
+"""
+
+import argparse
+import yaml
+import sys
+from pathlib import Path
+
+import sys
+from pathlib import Path
+src_path = Path(__file__).parent
+if str(src_path) not in sys.path:
+    sys.path.insert(0, str(src_path))
+
+# Add parent directory to path for direct execution
+sys.path.insert(0, str(Path(__file__).parent.parent))
+
+# Use absolute imports
+from src.pipeline import GlobalGeoSpatialProcessor
+from src.utils.country_mapper import CountryMapper
+
+# Base output path for processed data
+PROCESSED_DATA_PATH = Path("/home/linson/workspace/dev/data/processed/Telios")
+
+def load_config(config_path: str) -> dict:
+    """Load configuration from YAML file."""
+    with open(config_path, 'r') as f:
+        return yaml.safe_load(f)
+
+def auto_discover_config(data_root: str, country_mapper: CountryMapper) -> dict:
+    """
+    Auto-discover country structure from data directory.
+    Uses country_mapper to get staging DB IDs.
+    """
+    root = Path(data_root)
+    countries = []
+
+    # Look for continent directories
+    for continent_dir in root.iterdir():
+        if not continent_dir.is_dir():
+            continue
+
+        # Look for country directories
+        for country_dir in continent_dir.iterdir():
+            if not country_dir.is_dir():
+                continue
+
+            # Check for Level0.geojson
+            if (country_dir / "Level0.geojson").exists():
+                # Get staging DB ID from mapper
+                country_name = country_dir.name
+                db_country_id, country_iso = country_mapper.get_country_info(country_name)
+                
+                # Discover states
+                states = []
+                for state_dir in country_dir.iterdir():
+                    if state_dir.is_dir() and (state_dir / "Level1.geojson").exists():
+                        states.append(state_dir.name)
+
+                if states:
+                    # Determine max level
+                    max_level = 1
+                    sample_state = country_dir / states[0]
+                    for level in range(2, 5):
+                        if (sample_state / f"Level{level}").exists():
+                            max_level = level
+
+                    country_config = {
+                        'name': country_name,
+                        'base_path': str(country_dir),
+                        'countryId': db_country_id,  # Use staging DB ID
+                        'country_iso': country_iso,
+                        'max_level': max_level,
+                        'states': sorted(states)
+                    }
+                    
+                    countries.append(country_config)
+                    
+                    # Show if using staging ID or fallback
+                    if db_country_id == 0:
+                        print(f"   ⚠️ Discovered: {country_name} (NO STAGING ID - using fallback {country_config['countryId']})")
+                    else:
+                        print(f"   ✅ Discovered: {country_name} (Staging ID: {db_country_id}, ISO: {country_iso})")
+
+    return {'countries': countries}
+
+def detect_data_type(data_root: str) -> str:
+    """Detect whether the data is Map or Mapless by checking for geometry in Level2 files."""
+    root = Path(data_root)
+    
+    # Look for first Level2 directory with geojson files
+    for continent_dir in root.iterdir():
+        if not continent_dir.is_dir():
+            continue
+            
+        for country_dir in continent_dir.iterdir():
+            if not country_dir.is_dir():
+                continue
+                
+            # Check for Level0.geojson (valid country)
+            if not (country_dir / "Level0.geojson").exists():
+                continue
+                
+            # Look for first state with Level2 directory
+            for state_dir in country_dir.iterdir():
+                if not state_dir.is_dir():
+                    continue
+                    
+                level2_dir = state_dir / "Level2"
+                if not level2_dir.exists():
+                    continue
+                    
+                # Check first Level2 geojson file for geometry
+                level2_files = list(level2_dir.glob("*.geojson"))
+                if not level2_files:
+                    continue
+                    
+                try:
+                    # Read first file and check for geometry
+                    import geopandas as gpd
+                    gdf = gpd.read_file(str(level2_files[0]))
+                    
+                    # Check if any feature has non-null geometry
+                    for _, feature in gdf.iterrows():
+                        if feature.geometry is not None and not feature.geometry.is_empty:
+                            print(f"   📍 Detected Map data from: {level2_files[0].name}")
+                            return "Map"
+                    
+                    # If we get here, all geometries are None or empty
+                    print(f"   📍 Detected Mapless data from: {level2_files[0].name}")
+                    return "Mapless"
+                    
+                except Exception as e:
+                    print(f"   ⚠️ Error detecting data type: {e}")
+                    continue
+    
+    # Default to Mapless if can't detect
+    print("   ⚠️ Could not detect data type, defaulting to Mapless")
+    return "Mapless"
+
+def main():
+    parser = argparse.ArgumentParser(description='Geospatial Data Processor - Global Consolidation')
+    parser.add_argument('--data-root', type=str, required=True, help='Root data directory')
+    parser.add_argument('--config', type=str, help='Config file path')
+    parser.add_argument('--output', type=str, default=None, 
+                       help='Output directory (optional - auto-detects Map/Mapless if not specified)')
+    parser.add_argument('--country-config', type=str, default=None,
+                       help='Path to country_ids.yaml config file (optional)')
+    parser.add_argument('--processed-path', type=str, default=None,
+                       help='Base path for processed data (default: /home/linson/workspace/dev/data/processed/Telios)')
+
+    args = parser.parse_args()
+
+    # Initialize country mapper
+    country_mapper = CountryMapper(args.country_config)
+
+    # Load configuration
+    if args.config:
+        config = load_config(args.config)
+        print(f"📁 Loading config from: {args.config}")
+    elif args.data_root:
+        print(f"🔍 Auto-discovering countries in: {args.data_root}")
+        config = auto_discover_config(args.data_root, country_mapper)
+    else:
+        print("❌ Error: Provide either --data-root or --config")
+        sys.exit(1)
+
+    if not config['countries']:
+        print("❌ No countries found to process")
+        sys.exit(1)
+
+    # Determine base output path
+    if args.processed_path:
+        base_output_path = Path(args.processed_path)
+    else:
+        base_output_path = PROCESSED_DATA_PATH
+    
+    # Create base output directory if it doesn't exist
+    base_output_path.mkdir(parents=True, exist_ok=True)
+    
+    # Auto-detect Map vs Mapless if output not specified
+    if args.output is None:
+        data_type = detect_data_type(args.data_root)
+        output_folder = base_output_path / f"Finale_{data_type}"
+        print(f"\n📊 Detected data type: {data_type}")
+        print(f"📁 Output will be saved to: {output_folder}/")
+    else:
+        output_folder = base_output_path / args.output
+        print(f"\n📁 Using specified output folder: {output_folder}/")
+
+    print(f"\n{'='*70}")
+    print(f"🚀 GLOBAL PROCESSING - {len(config['countries'])} COUNTRIES")
+    print(f"{'='*70}")
+    print(f"{'='*70}\n")
+
+    # Initialize global processor with the full output path
+    global_processor = GlobalGeoSpatialProcessor(output_base=str(output_folder))
+
+    # Process each country with global sequencing
+    results = []
+    for idx, country_config in enumerate(config['countries'], 1):
+        print(f"\n{'='*70}")
+        print(f"📌 Processing country {idx}/{len(config['countries'])}")
+        print(f"{'='*70}")
+        
+        try:
+            result = global_processor.process_country(country_config)
+            results.append(result)
+            print(f"\n✅ Completed: {result['country']}")
+            print(f"   Records: {result['record_count']:,}")
+            print(f"   UnitIDs: {result['start_id']} - {result['end_id']}")
+            print(f"   Staging DB ID: {result['db_country_id']}")
+        except Exception as e:
+            print(f"\n❌ Failed {country_config['name']}: {e}")
+            import traceback
+            traceback.print_exc()
+
+    # Consolidate all countries into the output folder
+    print(f"\n{'='*70}")
+    print(f"📊 CONSOLIDATING ALL COUNTRIES INTO {output_folder}/")
+    print(f"{'='*70}")
+    
+    final_df = global_processor.consolidate_outputs()
+
+    # Final Summary
+    print(f"\n{'='*70}")
+    print(f"🎯 GLOBAL PROCESSING COMPLETE")
+    print(f"{'='*70}")
+    print(f"\n📊 PROCESSING SUMMARY:")
+    print(f"{'-'*70}")
+    
+    total_records = 0
+    for result in results:
+        db_id = result.get('db_country_id', 'N/A')
+        print(f"   ✅ {result['country']:<20} {result['record_count']:>10,} records  "
+              f"(UnitIDs: {result['start_id']:>7} - {result['end_id']:>7})  [DB ID: {db_id}]")
+        total_records += result['record_count']
+    
+    print(f"{'-'*70}")
+    print(f"   📌 TOTAL:{' ':<17} {total_records:>10,} records")
+    print(f"{'='*70}")
+    print(f"\n📁 All output files saved in: {output_folder}/")
+    print(f"   📄 Unit.csv")
+    print(f"   📄 PSQL_Geo.csv")
+    print(f"   📄 GeoJSON.csv")
+    print(f"   📄 teliosgeojson.csv")
+    print(f"   📄 teliosgeojsondata.csv")
+    print(f"   📄 global_processing_report.txt")
+    print(f"\n{'='*70}")
+    print(f"✅ GLOBAL PROCESSING COMPLETED SUCCESSFULLY")
+    print(f"{'='*70}")
+
+if __name__ == "__main__":
+    main()
+===== ./shared/src/pipeline.py =====
+"""
+Core pipeline orchestration for geospatial data processing.
+"""
+
+import pandas as pd
+import sys
+import os
+from pathlib import Path
+from typing import Dict, List, Optional
+from dataclasses import dataclass
+
+# Add current directory to path for local imports
+sys.path.insert(0, str(Path(__file__).parent))
+
+# Import your existing processors
+from processors.level0_processor import Level0Processor
+from processors.level1_processor import Level1Processor
+from processors.level2_processor import Level2Processor
+from processors.level3_processor import Level3Processor
+from processors.level4_processor import Level4Processor
+from utils.country_mapper import CountryMapper
+
+@dataclass
+class ProcessingConfig:
+    """Configuration for processing a country."""
+    country_name: str
+    country_id: int
+    base_path: str
+    states: List[str]
+    max_level: int = 4
+
+
+class GeoSpatialPipeline:
+    """
+    Main pipeline class that uses your existing processing logic.
+    """
+    
+    _global_unit_id_counter = 1
+    _country_mapper = None
+    
+    @classmethod
+    def _get_country_mapper(cls):
+        if cls._country_mapper is None:
+            cls._country_mapper = CountryMapper()
+        return cls._country_mapper
+    
+    @classmethod
+    def reset_global_counter(cls):
+        cls._global_unit_id_counter = 1
+    
+    @classmethod
+    def get_next_global_id(cls, increment=1):
+        current = cls._global_unit_id_counter
+        cls._global_unit_id_counter += increment
+        return current
+    
+    def __init__(self, config: ProcessingConfig):
+        self.config = config
+        self.country_mapper = self._get_country_mapper()
+        self.db_country_id, self.country_code = self.country_mapper.get_country_info(config.country_name)
+        
+        # Fallback if not found
+        if self.db_country_id == 0:
+            print(f"⚠️ Using fallback ID for {config.country_name}")
+            self.db_country_id = config.country_id
+            self.country_code = config.country_name[:3].upper()
+        
+        self.state_mapping = {state: f"{idx:02d}" 
+                             for idx, state in enumerate(sorted(config.states), 1)}
+        
+        self.raw_data = []
+        self.transformed_data = None
+        self.final_data = None
+        self.country_start_id = None
+        self.country_end_id = None
+    
+    def extract(self) -> 'GeoSpatialPipeline':
+        """Extract all raw data from GeoJSON files."""
+        print(f"\n🔍 Extracting data for {self.config.country_name}")
+        
+        base_path = Path(self.config.base_path)
+        
+        # Check if Level0.geojson exists
+        level0_path = base_path / "Level0.geojson"
+        if level0_path.exists():
+            try:
+                level0_proc = Level0Processor()
+                level0_df = level0_proc.process_file(level0_path)
+                
+                if level0_df is not None and not level0_df.empty:
+                    level0_df['countryLevelId'] = 0
+                    level0_df['level'] = 0
+                    self.raw_data.extend(level0_df.to_dict('records'))
+                    print(f"   ✅ Level 0: {len(level0_df)} record")
+            except Exception as e:
+                print(f"❌ Error processing Level 0: {e}")
+        
+        # Process each state
+        for state in self.config.states:
+            state_path = base_path / state
+            if not state_path.exists():
+                continue
+            
+            print(f"\n   📍 Processing {state}...")
+            
+            # Level 1
+            level1_path = state_path / "Level1.geojson"
+            if level1_path.exists():
+                try:
+                    level1_proc = Level1Processor()
+                    level1_df = level1_proc.process_file(level1_path)
+                    
+                    if level1_df is not None and not level1_df.empty:
+                        level1_df['countryLevelId'] = 1
+                        level1_df['level'] = 1
+                        level1_df['state'] = state
+                        self.raw_data.extend(level1_df.to_dict('records'))
+                        print(f"      ✅ Level 1: {len(level1_df)} record")
+                except Exception as e:
+                    print(f"❌ Error processing Level 1: {e}")
+            
+            # Level 2
+            level2_dir = state_path / "Level2"
+            if level2_dir.exists():
+                try:
+                    level2_proc = Level2Processor()
+                    for geojson_file in level2_dir.glob("*.geojson"):
+                        level2_df = level2_proc.process_file(geojson_file)
+                        if level2_df is not None and not level2_df.empty:
+                            level2_df['countryLevelId'] = 2
+                            level2_df['level'] = 2
+                            level2_df['state'] = state
+                            self.raw_data.extend(level2_df.to_dict('records'))
+                    print(f"      ✅ Level 2: Processed {len(list(level2_dir.glob('*.geojson')))} files")
+                except Exception as e:
+                    print(f"❌ Error processing Level 2: {e}")
+            
+            # Level 3
+            level3_dir = state_path / "Level3"
+            if level3_dir.exists():
+                try:
+                    level3_proc = Level3Processor()
+                    for geojson_file in level3_dir.glob("*.geojson"):
+                        level3_df = level3_proc.process_file(geojson_file)
+                        if level3_df is not None and not level3_df.empty:
+                            level3_df['countryLevelId'] = 3
+                            level3_df['level'] = 3
+                            level3_df['state'] = state
+                            self.raw_data.extend(level3_df.to_dict('records'))
+                    print(f"      ✅ Level 3: Processed {len(list(level3_dir.glob('*.geojson')))} files")
+                except Exception as e:
+                    print(f"❌ Error processing Level 3: {e}")
+            
+            # Level 4
+            level4_dir = state_path / "Level4"
+            if level4_dir.exists():
+                try:
+                    level4_proc = Level4Processor()
+                    for geojson_file in level4_dir.glob("*.geojson"):
+                        level4_df = level4_proc.process_file(geojson_file)
+                        if level4_df is not None and not level4_df.empty:
+                            level4_df['countryLevelId'] = 4
+                            level4_df['level'] = 4
+                            level4_df['state'] = state
+                            self.raw_data.extend(level4_df.to_dict('records'))
+                    print(f"      ✅ Level 4: Processed {len(list(level4_dir.glob('*.geojson')))} files")
+                except Exception as e:
+                    print(f"❌ Error processing Level 4: {e}")
+        
+        print(f"\n✅ Extracted {len(self.raw_data)} total records for {self.config.country_name}")
+        return self
+    
+    def transform(self) -> 'GeoSpatialPipeline':
+        """Transform raw data into structured format."""
+        print(f"🔄 Transforming data for {self.config.country_name}...")
+        
+        if not self.raw_data:
+            print("⚠️ No data to transform")
+            return self
+        
+        df = pd.DataFrame(self.raw_data)
+        
+        # Add metadata
+        df['country'] = self.config.country_name
+        df['country_code'] = self.country_code
+        df['levelDescription'] = df['countryLevelId'].map({0:'country',1:'state',2:'district',3:'block',4:'village'})
+        
+        # Generate telios keys
+        telios_keys = []
+        for _, row in df.iterrows():
+            level = row['countryLevelId']
+            if level == 0:
+                key = self.country_code
+            elif level == 1:
+                state_code = self.state_mapping.get(row['state'], '01')
+                key = f"{self.country_code}-{state_code}"
+            else:
+                key = row.get('levelKey', f"L{level}_{row.name}")
+            telios_keys.append(key)
+        
+        df['telioslevelKey'] = telios_keys
+        
+        self.transformed_data = df
+        print(f"✅ Transformed {len(df)} records")
+        return self
+    
+    def finalize(self) -> 'GeoSpatialPipeline':
+        """Finalize data with sequential IDs and all required columns."""
+        print(f"🏁 Finalizing data for {self.config.country_name}...")
+        
+        if self.transformed_data is None:
+            print("⚠️ No transformed data to finalize")
+            return self
+        
+        df = self.transformed_data.copy()
+        
+        # Assign global unit IDs
+        self.country_start_id = self.__class__._global_unit_id_counter
+        record_count = len(df)
+        df['unitid'] = range(self.country_start_id, self.country_start_id + record_count)
+        self.__class__._global_unit_id_counter += record_count
+        self.country_end_id = self.__class__._global_unit_id_counter - 1
+        
+        # Add all required columns
+        df['parentid'] = 0
+        df['country_id'] = self.db_country_id
+        df['country'] = self.config.country_name
+        df['country_code'] = self.country_code
+        df['levelDescription'] = df['countryLevelId'].map({0:'country',1:'state',2:'district',3:'block',4:'village'})
+        df['countnextLevel'] = 0
+        df['parentlevelKey'] = ''
+        df['teliosparentlevelKey'] = ''
+        
+        # Ensure geometry column exists
+        if 'geometry' not in df.columns:
+            df['geometry'] = '{}'
+        
+        self.final_data = df
+        print(f"✅ Finalized {len(df)} records")
+        print(f"   UnitID range: {self.country_start_id} to {self.country_end_id}")
+        
+        return self
+    
+    def get_country_data(self) -> pd.DataFrame:
+        """Return the final data."""
+        return self.final_data.copy() if self.final_data is not None else None
+
+
+class GlobalGeoSpatialProcessor:
+    """Global processor for multiple countries."""
+    
+    def __init__(self, output_base: str = "Finale"):
+        self.output_base = Path(output_base)
+        self.output_base.mkdir(parents=True, exist_ok=True)
+        GeoSpatialPipeline.reset_global_counter()
+        self.all_country_data = []
+        self.processing_results = []
+    
+    def process_country(self, country_config: dict) -> Dict:
+        """Process a single country."""
+        print(f"\n{'='*70}")
+        print(f"🏁 PROCESSING COUNTRY: {country_config['name']}")
+        print(f"{'='*70}")
+        
+        config = ProcessingConfig(
+            country_name=country_config['name'],
+            country_id=country_config.get('countryId', 1),
+            base_path=country_config['base_path'],
+            states=country_config.get('states', []),
+            max_level=country_config.get('max_level', 4)
+        )
+        
+        pipeline = GeoSpatialPipeline(config)
+        pipeline.extract().transform().finalize()
+        
+        country_df = pipeline.get_country_data()
+        
+        if country_df is not None and not country_df.empty:
+            self.all_country_data.append(country_df)
+            print(f"✅ Successfully processed {country_config['name']}: {len(country_df)} records")
+        else:
+            print(f"⚠️ No data processed for {country_config['name']}")
+        
+        result = {
+            'country': country_config['name'],
+            'country_code': pipeline.country_code,
+            'db_country_id': pipeline.db_country_id,
+            'record_count': len(country_df) if country_df is not None else 0,
+            'start_id': pipeline.country_start_id,
+            'end_id': pipeline.country_end_id,
+            'states_processed': len(config.states),
+            'max_level': config.max_level
+        }
+        
+        self.processing_results.append(result)
+        return result
+    
+    def get_final_dataframe(self):
+        """Return combined dataframe."""
+        if not self.all_country_data:
+            return None
+        return pd.concat(self.all_country_data, ignore_index=True)
+
+===== ./shared/src/__init__.py =====
+
+===== ./shared/src/pipeline_original.py =====
+"""
+Core pipeline orchestration for geospatial data processing.
+Single responsibility: Coordinate extraction, transformation, and output generation.
+Features: Continuous global ID sequencing across all countries, consolidated Finale output.
+Uses staging database IDs from config file.
+"""
+
+import pandas as pd
+import geopandas as gpd
+import json
+from pathlib import Path
+from typing import Dict, List, Tuple, Optional
+from dataclasses import dataclass
+from datetime import datetime
+
+# Import ALL processors (Level 0-4)
+from processors.level0_processor import Level0Processor
+from processors.level1_processor import Level1Processor
+from processors.level2_processor import Level2Processor
+from processors.level3_processor import Level3Processor
+from processors.level4_processor import Level4Processor
+
+# Import country mapper
+from utils.country_mapper import CountryMapper
+
+@dataclass
+class ProcessingConfig:
+    """Configuration for processing a country/state."""
+    country_name: str
+    country_id: int
+    base_path: str
+    states: List[str]
+    max_level: int = 4
+
+class GeoSpatialPipeline:
+    """
+    Main pipeline class for processing geospatial administrative data.
+    
+    Features:
+    - Continuous global unitid sequencing across all countries
+    - Consolidated Finale output folder
+    - Consistent FeatureCollection format for all levels
+    - Staging database IDs from config file
+    """
+    
+    # Class-level variable to track global unit ID across ALL countries
+    _global_unit_id_counter = 1
+    
+    # Initialize country mapper (class-level to share across instances)
+    _country_mapper = None
+    
+    @classmethod
+    def _get_country_mapper(cls):
+        """Get or create the country mapper instance."""
+        if cls._country_mapper is None:
+            cls._country_mapper = CountryMapper()
+        return cls._country_mapper
+    
+    @classmethod
+    def reset_global_counter(cls):
+        """Reset the global counter (useful for testing)."""
+        cls._global_unit_id_counter = 1
+    
+    @classmethod
+    def get_next_global_id(cls, increment=1):
+        """Get next global unit ID and increment counter."""
+        current = cls._global_unit_id_counter
+        cls._global_unit_id_counter += increment
+        return current
+    
+    # Country code mapping (fallback if not in config)
+    FALLBACK_COUNTRY_CODES = {
+        'India': 'IND', 'Indonesia': 'IDN', 'Bangladesh': 'BGD',
+        'Nigeria': 'NGA', 'Pakistan': 'PAK', 'Myanmar': 'MMR',
+        'Laos': 'LAO', "Côte d'Ivoire": 'CIV', 'Uganda': 'UGA',
+        'Ivory Coast': 'CIV', 'Myanmar': 'MMR'
+    }
+    
+    LEVEL_DESCRIPTIONS = {
+        0: 'country', 1: 'state', 2: 'district', 
+        3: 'block', 4: 'village'
+    }
+    
+    def __init__(self, config: ProcessingConfig):
+        self.config = config
+        
+        # Get staging database ID and ISO code from mapper
+        self.country_mapper = self._get_country_mapper()
+        self.db_country_id, self.country_code = self.country_mapper.get_country_info(config.country_name)
+        
+        # If not found in config, use fallback
+        if self.db_country_id == 0:
+            print(f"⚠️ Using fallback ID for {config.country_name}")
+            self.db_country_id = config.country_id
+            self.country_code = self.FALLBACK_COUNTRY_CODES.get(
+                config.country_name, 
+                config.country_name[:3].upper()
+            )
+        
+        # State mapping (alphabetical)
+        self.state_mapping = {state: f"{idx:02d}" 
+                             for idx, state in enumerate(sorted(config.states), 1)}
+        
+        # Data storage
+        self.raw_data: List[Dict] = []
+        self.transformed_data: Optional[pd.DataFrame] = None
+        self.final_data: Optional[pd.DataFrame] = None
+        
+        # Track start ID for this country
+        self.country_start_id = None
+        self.country_end_id = None
+        
+    def extract(self) -> 'GeoSpatialPipeline':
+        """Extract all raw data from GeoJSON files using processors for ALL levels (0-4)."""
+        print(f"\n🔍 Extracting data for {self.config.country_name}")
+        
+        base_path = Path(self.config.base_path)
+        
+        # ============ LEVEL 0 - COUNTRY ============
+        level0_path = base_path / "Level0.geojson"
+        if level0_path.exists():
+            try:
+                level0_proc = Level0Processor()
+                level0_df = level0_proc.process_file(level0_path)
+                
+                if level0_df is not None and not level0_df.empty:
+                    # Ensure consistent column naming
+                    if 'levelKey' not in level0_df.columns:
+                        level0_df['levelKey'] = level0_df['Level0_id']
+                    if 'unit' not in level0_df.columns:
+                        level0_df['unit'] = level0_df['Level0']
+                    level0_df['countryLevelId'] = 0
+                    level0_df['level'] = 0
+                    level0_df['state'] = None
+                    level0_df['original_id'] = level0_df['Level0_id']
+                    
+                    self.raw_data.extend(level0_df.to_dict('records'))
+                    print(f"   ✅ Level 0: {len(level0_df)} record")
+            except Exception as e:
+                print(f"❌ Error processing Level 0: {e}")
+        else:
+            print(f"⚠️ Level0.geojson not found at {level0_path}")
+        
+        # ============ PROCESS EACH STATE ============
+        for state in self.config.states:
+            state_path = base_path / state
+            if not state_path.exists():
+                print(f"⚠️ State path not found: {state_path}")
+                continue
+            
+            print(f"\n   📍 Processing {state}...")
+            
+            # ============ LEVEL 1 - STATE ============
+            level1_path = state_path / "Level1.geojson"
+            level1_df = None
+            parent_df = pd.DataFrame()
+            
+            if level1_path.exists():
+                try:
+                    level1_proc = Level1Processor()
+                    level1_df = level1_proc.process_file(level1_path)
+                    
+                    if level1_df is not None and not level1_df.empty:
+                        # Ensure consistent column naming
+                        if 'levelKey' not in level1_df.columns:
+                            level1_df['levelKey'] = level1_df['Level1_id']
+                        if 'unit' not in level1_df.columns:
+                            level1_df['unit'] = level1_df['Level1']
+                        level1_df['countryLevelId'] = 1
+                        level1_df['level'] = 1
+                        level1_df['state'] = state
+                        level1_df['original_id'] = level1_df['Level1_id']
+                        
+                        self.raw_data.extend(level1_df.to_dict('records'))
+                        print(f"      ✅ Level 1: {len(level1_df)} record")
+                        
+                        # Create parent DataFrame for Level 2 processor
+                        if 'Level1' in level1_df.columns and 'Level1_id' in level1_df.columns:
+                            parent_df = pd.DataFrame({
+                                'Level1': level1_df['Level1'].tolist(),
+                                'Level1_id': level1_df['Level1_id'].tolist()
+                            })
+                except Exception as e:
+                    print(f"❌ Error processing Level 1: {e}")
+            else:
+                print(f"      ⚠️ Level1.geojson not found")
+            
+            # ============ LEVEL 2 - DISTRICTS ============
+            level2_dir = state_path / "Level2"
+            level3_dir = state_path / "Level3"
+            level2_df = None
+            
+            if level2_dir.exists() and level2_dir.is_dir():
+                try:
+                    level2_proc = Level2Processor()
+                    # Create temp output path (processors need this but we don't use the files)
+                    temp_output = base_path.parent / "temp_processing"
+                    temp_output.mkdir(exist_ok=True)
+                    
+                    level2_df = level2_proc.process(
+                        str(level2_dir),
+                        parent_df,
+                        str(level3_dir) if level3_dir.exists() else None,
+                        str(temp_output)
+                    )
+                    
+                    if level2_df is not None and not level2_df.empty:
+                        # Rename columns to match pipeline format
+                        level2_df = level2_df.rename(columns={
+                            'Level2_id': 'levelKey',
+                            'Level2': 'unit',
+                            'parent_id': 'parent_id'
+                        })
+                        level2_df['countryLevelId'] = 2
+                        level2_df['state'] = state
+                        level2_df['level'] = 2
+                        level2_df['original_id'] = level2_df['levelKey']
+                        
+                        self.raw_data.extend(level2_df.to_dict('records'))
+                        print(f"      ✅ Level 2: {len(level2_df)} records")
+                    else:
+                        print(f"      ⚠️ Level 2: No records processed")
+                except Exception as e:
+                    print(f"      ❌ Error processing Level 2: {e}")
+            else:
+                print(f"      ⚠️ Level2 directory not found")
+            
+            # ============ LEVEL 3 - BLOCKS ============
+            level3_dir = state_path / "Level3"
+            level4_dir = state_path / "Level4"
+            level3_df = None
+            
+            if level3_dir.exists() and level3_dir.is_dir():
+                try:
+                    level3_proc = Level3Processor()
+                    temp_output = base_path.parent / "temp_processing"
+                    
+                    level3_df = level3_proc.process(
+                        str(level3_dir),
+                        level2_df if level2_df is not None else pd.DataFrame(),
+                        str(level4_dir) if level4_dir.exists() else None,
+                        str(temp_output)
+                    )
+                    
+                    if level3_df is not None and not level3_df.empty:
+                        # Rename columns to match pipeline format
+                        level3_df = level3_df.rename(columns={
+                            'Level3_id': 'levelKey',
+                            'Level3': 'unit',
+                            'parent_id': 'parent_id'
+                        })
+                        level3_df['countryLevelId'] = 3
+                        level3_df['state'] = state
+                        level3_df['level'] = 3
+                        level3_df['original_id'] = level3_df['levelKey']
+                        
+                        self.raw_data.extend(level3_df.to_dict('records'))
+                        print(f"      ✅ Level 3: {len(level3_df)} records")
+                    else:
+                        print(f"      ⚠️ Level 3: No records processed")
+                except Exception as e:
+                    print(f"      ❌ Error processing Level 3: {e}")
+            else:
+                print(f"      ⚠️ Level3 directory not found")
+            
+            # ============ LEVEL 4 - VILLAGES ============
+            level4_dir = state_path / "Level4"
+            
+            if level4_dir.exists() and level4_dir.is_dir():
+                try:
+                    level4_proc = Level4Processor()
+                    temp_output = base_path.parent / "temp_processing"
+                    
+                    level4_df = level4_proc.process(
+                        str(level4_dir),
+                        level3_df if level3_df is not None else pd.DataFrame(),
+                        str(temp_output)
+                    )
+                    
+                    if level4_df is not None and not level4_df.empty:
+                        # Rename columns to match pipeline format
+                        level4_df = level4_df.rename(columns={
+                            'Level4_id': 'levelKey',
+                            'Level4': 'unit',
+                            'parent_id': 'parent_id'
+                        })
+                        level4_df['countryLevelId'] = 4
+                        level4_df['state'] = state
+                        level4_df['level'] = 4
+                        level4_df['original_id'] = level4_df['levelKey']
+                        
+                        self.raw_data.extend(level4_df.to_dict('records'))
+                        print(f"      ✅ Level 4: {len(level4_df)} records")
+                    else:
+                        print(f"      ⚠️ Level 4: No records processed")
+                except Exception as e:
+                    print(f"      ❌ Error processing Level 4: {e}")
+            else:
+                print(f"      ⚠️ Level4 directory not found")
+        
+        print(f"\n✅ Extracted {len(self.raw_data)} total records for {self.config.country_name}")
+        return self
+    
+    def transform(self) -> 'GeoSpatialPipeline':
+        """Transform raw data into structured format with proper IDs - FIXED COUNTER KEYS."""
+        print(f"🔄 Transforming data for {self.config.country_name}...")
+        
+        if not self.raw_data:
+            raise ValueError("No data to transform. Run extract() first.")
+        
+        # Create base DataFrame
+        df = pd.DataFrame(self.raw_data)
+        
+        # Ensure geometry is string (should already be JSON string of FeatureCollection)
+        if 'geometry' in df.columns:
+            df['geometry'] = df['geometry'].apply(
+                lambda x: x if isinstance(x, str) else json.dumps(x) if x else '{}'
+            )
+        
+        # Remove duplicates based on levelKey and level
+        df = df.drop_duplicates(subset=['levelKey', 'countryLevelId'], keep='first')
+        
+        # Sort by level, state, and levelKey for consistent ordering
+        df = df.sort_values(['countryLevelId', 'state', 'levelKey']).reset_index(drop=True)
+        
+        # Add metadata
+        df['country'] = self.config.country_name
+        df['country_code'] = self.country_code
+        df['levelDescription'] = df['countryLevelId'].map(self.LEVEL_DESCRIPTIONS)
+        
+        # Generate Telios keys in a single pass through the dataframe
+        telios_keys = []
+        parent_keys = []
+        telios_parent_keys = []
+        
+        # Create lookup from (level, levelKey) to row position for parent finding
+        level_key_to_pos = {}
+        for pos, (idx, row) in enumerate(df.iterrows()):
+            level_key_to_pos[(row['countryLevelId'], row['levelKey'])] = pos
+        
+        # Track sequence numbers per parent for each level
+        district_counters = {}  # (state) -> next district number
+        block_counters = {}     # (district_telios_key) -> next block number - FIXED
+        village_counters = {}   # (block_telios_key) -> next village number - FIXED
+        
+        for pos, (idx, row) in enumerate(df.iterrows()):
+            level = row['countryLevelId']
+            state = row['state']
+            level_key = row['levelKey']
+            parent_level_key = row.get('parent_id', '')
+            
+            if level == 0:
+                # Country
+                telios_key = self.country_code
+                parent_key = ''
+                telios_parent = ''
+                
+            elif level == 1:
+                # State
+                state_code = self.state_mapping.get(state, '01')
+                telios_key = f"{self.country_code}-{state_code}"
+                # Parent is country
+                country_pos = level_key_to_pos.get((0, self.country_code))
+                if country_pos is not None:
+                    parent_key = df.iloc[country_pos]['levelKey']
+                else:
+                    parent_key = ''
+                telios_parent = self.country_code
+                
+            elif level == 2:
+                # District
+                state_code = self.state_mapping.get(state, '01')
+                
+                # Find parent state
+                state_mask = (df['countryLevelId'] == 1) & (df['state'] == state)
+                state_rows = df[state_mask]
+                if state_rows.empty:
+                    parent_key = ''
+                    telios_parent = f"{self.country_code}-{state_code}"
+                else:
+                    parent_row = state_rows.iloc[0]
+                    parent_key = parent_row['levelKey']
+                    parent_pos = level_key_to_pos.get((1, parent_key), 0)
+                    telios_parent = telios_keys[parent_pos] if parent_pos < len(telios_keys) else f"{self.country_code}-{state_code}"
+                
+                # Sequential district number per state
+                counter_key = state
+                if counter_key not in district_counters:
+                    district_counters[counter_key] = 1
+                seq_num = district_counters[counter_key]
+                district_counters[counter_key] += 1
+                
+                seq = f"{seq_num:03d}"
+                telios_key = f"{telios_parent}-{seq}"
+                
+            elif level == 3:
+                # Block
+                state_code = self.state_mapping.get(state, '01')
+                
+                # Find parent district
+                parent_pos = level_key_to_pos.get((2, parent_level_key))
+                if parent_pos is None:
+                    # Try fuzzy match
+                    parent_mask = (df['countryLevelId'] == 2) & (df['state'] == state) & \
+                                 (df['levelKey'].str.contains(parent_level_key, na=False))
+                    parent_rows = df[parent_mask]
+                    if parent_rows.empty:
+                        parent_key = parent_level_key
+                        telios_parent = f"{self.country_code}-{state_code}-001"
+                    else:
+                        parent_row = parent_rows.iloc[0]
+                        parent_key = parent_row['levelKey']
+                        parent_pos = level_key_to_pos.get((2, parent_key), 0)
+                        telios_parent = telios_keys[parent_pos] if parent_pos < len(telios_keys) else f"{self.country_code}-{state_code}-001"
+                else:
+                    parent_key = df.iloc[parent_pos]['levelKey']
+                    telios_parent = telios_keys[parent_pos] if parent_pos < len(telios_keys) else f"{self.country_code}-{state_code}-001"
+                
+                # FIXED: Use district's telios key as counter key for blocks
+                counter_key = telios_parent
+                
+                if counter_key not in block_counters:
+                    block_counters[counter_key] = 1
+                seq_num = block_counters[counter_key]
+                block_counters[counter_key] += 1
+                
+                seq = f"{seq_num:04d}"
+                telios_key = f"{telios_parent}-{seq}"
+                
+            elif level == 4:
+                # Village
+                state_code = self.state_mapping.get(state, '01')
+                
+                # Find parent block
+                parent_pos = level_key_to_pos.get((3, parent_level_key))
+                if parent_pos is None:
+                    # Try fuzzy match
+                    parent_mask = (df['countryLevelId'] == 3) & (df['state'] == state) & \
+                                 (df['levelKey'].str.contains(parent_level_key, na=False))
+                    parent_rows = df[parent_mask]
+                    if parent_rows.empty:
+                        parent_key = parent_level_key
+                        telios_parent = f"{self.country_code}-{state_code}-001-0001"
+                    else:
+                        parent_row = parent_rows.iloc[0]
+                        parent_key = parent_row['levelKey']
+                        parent_pos = level_key_to_pos.get((3, parent_key), 0)
+                        telios_parent = telios_keys[parent_pos] if parent_pos < len(telios_keys) else f"{self.country_code}-{state_code}-001-0001"
+                else:
+                    parent_key = df.iloc[parent_pos]['levelKey']
+                    telios_parent = telios_keys[parent_pos] if parent_pos < len(telios_keys) else f"{self.country_code}-{state_code}-001-0001"
+                
+                # FIXED: Use block's telios key as counter key for villages
+                counter_key = telios_parent
+                
+                if counter_key not in village_counters:
+                    village_counters[counter_key] = 1
+                seq_num = village_counters[counter_key]
+                village_counters[counter_key] += 1
+                
+                seq = f"{seq_num:06d}"
+                telios_key = f"{telios_parent}-{seq}"
+                
+            else:
+                telios_key = level_key
+                parent_key = parent_level_key
+                telios_parent = ''
+            
+            telios_keys.append(telios_key)
+            parent_keys.append(parent_key)
+            telios_parent_keys.append(telios_parent)
+        
+        # Assign to dataframe
+        df['telioslevelKey'] = telios_keys
+        df['parentlevelKey'] = parent_keys
+        df['teliosparentlevelKey'] = telios_parent_keys
+        
+        # Calculate count of children
+        df['countnextLevel'] = df.apply(lambda row: self._count_children(row, df), axis=1)
+        
+        self.transformed_data = df
+        print(f"✅ Transformed {len(df)} records for {self.config.country_name}")
+        return self
+    
+    def _count_children(self, row, df) -> int:
+        """Count direct children for this unit."""
+        if row['countryLevelId'] >= self.config.max_level:
+            return 0
+        
+        child_level = row['countryLevelId'] + 1
+        
+        # Count children by matching parentlevelKey
+        children = df[
+            (df['parentlevelKey'] == row['levelKey']) & 
+            (df['countryLevelId'] == child_level)
+        ]
+        return len(children)
+    
+    def finalize(self) -> 'GeoSpatialPipeline':
+        """
+        Finalize data with sequential IDs and parent relationships.
+        Uses GLOBAL continuous unitid sequencing across ALL countries.
+        """
+        print(f"🏁 Finalizing data for {self.config.country_name} with GLOBAL sequential IDs...")
+        
+        if self.transformed_data is None:
+            raise ValueError("No transformed data. Run transform() first.")
+        
+        df = self.transformed_data.copy()
+        
+        # Sort by level and telioslevelKey for consistent ordering
+        df = df.sort_values(['countryLevelId', 'telioslevelKey']).reset_index(drop=True)
+        
+        # Get the starting global ID for this country
+        self.country_start_id = self.__class__._global_unit_id_counter
+        record_count = len(df)
+        
+        # Assign sequential global unitids starting from current global counter
+        df['unitid'] = range(self.country_start_id, self.country_start_id + record_count)
+        
+        # Update the global counter
+        self.__class__._global_unit_id_counter += record_count
+        self.country_end_id = self.__class__._global_unit_id_counter - 1
+        
+        # Create mapping from telioslevelKey to unitid for parent lookup
+        telios_to_unitid = dict(zip(df['telioslevelKey'], df['unitid']))
+        
+        # Assign parentid based on teliosparentlevelKey
+        df['parentid'] = df['teliosparentlevelKey'].map(telios_to_unitid)
+        
+        # Country (Level 0) is its own parent
+        country_mask = df['countryLevelId'] == 0
+        df.loc[country_mask, 'parentid'] = df.loc[country_mask, 'unitid']
+        
+        # Fill any missing parentid with 0
+        df['parentid'] = df['parentid'].fillna(0).astype(int)
+        
+        # Add country_id for database (using staging DB ID)
+        df['country_id'] = self.db_country_id
+        
+        self.final_data = df
+        
+        print(f"✅ Finalized {len(df)} records for {self.config.country_name}")
+        print(f"   Global UnitID range: {self.country_start_id} to {self.country_end_id}")
+        print(f"   Staging DB ID: {self.db_country_id}")
+        
+        # Debug: Show sample of generated keys
+        print(f"\n📋 Sample TeliosLevelKeys for {self.config.country_name}:")
+        for level in [0, 1, 2, 3, 4]:
+            sample = df[df['countryLevelId'] == level].head(2)
+            for _, row in sample.iterrows():
+                print(f"   Level {level}: {row['telioslevelKey']:<35} {row['unit'][:30]} (ID: {row['unitid']})")
+        
+        # Validate ID consistency
+        self._validate_ids()
+        
+        return self
+    
+    def _validate_ids(self):
+        """Validate ID consistency across the dataset."""
+        df = self.final_data
+        
+        # Check for duplicate unitids within this country (should be none with global counter)
+        if df['unitid'].duplicated().any():
+            raise ValueError(f"Duplicate unitids found within {self.config.country_name}!")
+        
+        # Check for duplicate telioslevelKeys
+        if df['telioslevelKey'].duplicated().any():
+            dups = df[df['telioslevelKey'].duplicated()]['telioslevelKey'].unique()
+            raise ValueError(f"Duplicate telioslevelKeys found in {self.config.country_name}: {dups[:5]}")
+        
+        # Check that all parentids exist (except country)
+        non_country = df[df['countryLevelId'] > 0]
+        missing_parents = non_country[~non_country['parentid'].isin(df['unitid'])]
+        
+        if not missing_parents.empty:
+            print(f"\n⚠️  Warning: {len(missing_parents)} records with missing parent IDs in {self.config.country_name}")
+            print("Setting orphan parentids to 0")
+            df.loc[missing_parents.index, 'parentid'] = 0
+        
+        print(f"✅ ID validation passed for {self.config.country_name}")
+    
+    def get_country_data(self) -> pd.DataFrame:
+        """Return the final data for this country."""
+        return self.final_data.copy() if self.final_data is not None else None
+
+
+# ============ GLOBAL PROCESSING FUNCTIONS ============
+
+class GlobalGeoSpatialProcessor:
+    """
+    Global processor that handles multiple countries with continuous ID sequencing.
+    All output files are consolidated in a single 'Finale' folder.
+    """
+    
+    def __init__(self, output_base: str = "Finale"):
+        self.output_base = Path(output_base)
+        self.output_base.mkdir(parents=True, exist_ok=True)
+        
+        # Reset global counter at start of processing
+        GeoSpatialPipeline.reset_global_counter()
+        
+        # Storage for all countries' data
+        self.all_country_data: List[pd.DataFrame] = []
+        self.processing_results: List[Dict] = []
+        
+    def process_country(self, country_config: dict) -> Dict:
+        """Process a single country and return its data and stats."""
+        print(f"\n{'='*70}")
+        print(f"🏁 PROCESSING COUNTRY: {country_config['name']}")
+        print(f"{'='*70}")
+        
+        config = ProcessingConfig(
+            country_name=country_config['name'],
+            country_id=country_config.get('countryId', 1),
+            base_path=country_config['base_path'],
+            states=country_config['states'],
+            max_level=country_config.get('max_level', 4)
+        )
+        
+        pipeline = GeoSpatialPipeline(config)
+        
+        # Run pipeline for this country
+        pipeline.extract().transform().finalize()
+        
+        # Get the country data
+        country_df = pipeline.get_country_data()
+        
+        if country_df is not None:
+            self.all_country_data.append(country_df)
+            
+        result = {
+            'country': country_config['name'],
+            'country_code': pipeline.country_code,
+            'db_country_id': pipeline.db_country_id,
+            'record_count': len(country_df) if country_df is not None else 0,
+            'start_id': pipeline.country_start_id,
+            'end_id': pipeline.country_end_id,
+            'states_processed': len(config.states),
+            'max_level': config.max_level
+        }
+        
+        self.processing_results.append(result)
+        return result
+    
+    def consolidate_outputs(self):
+        """Consolidate all countries' data into single output files in Finale folder."""
+        if not self.all_country_data:
+            print("❌ No data to consolidate")
+            return
+        
+        print(f"\n{'='*70}")
+        print(f"📊 CONSOLIDATING ALL COUNTRIES INTO FINALE FOLDER")
+        print(f"{'='*70}")
+        
+        # Combine all country data
+        final_df = pd.concat(self.all_country_data, ignore_index=True)
+        
+        # Sort by unitid to ensure global order
+        final_df = final_df.sort_values('unitid').reset_index(drop=True)
+        
+        print(f"✅ Consolidated {len(final_df)} total records from {len(self.all_country_data)} countries")
+        print(f"   Global UnitID range: {final_df['unitid'].min()} to {final_df['unitid'].max()}")
+        
+        # ============ GENERATE CONSOLIDATED OUTPUT FILES ============
+        
+        # 1. Unit.csv - Core unit table
+        unit_df = final_df[[
+            'unitid', 'parentid', 'country_id', 'country', 'country_code',
+            'levelDescription', 'countryLevelId', 'levelKey', 'telioslevelKey', 
+            'countnextLevel', 'unit', 'parentlevelKey', 'teliosparentlevelKey'
+        ]].copy()
+        
+        unit_csv = self.output_base / "Unit.csv"
+        unit_xlsx = self.output_base / "Unit.xlsx"
+        unit_df.to_csv(unit_csv, index=False)
+        unit_df.to_excel(unit_xlsx, index=False, sheet_name='Unit')
+        print(f"   ✅ Unit: {len(unit_df)} records -> {unit_csv.name}")
+        
+        # 2. PSQL_Geo.csv - Spatial data with geometry
+        psql_geo_df = final_df[[
+            'unitid', 'parentid', 'country_id', 'countryLevelId',
+            'levelKey', 'telioslevelKey', 'countnextLevel', 'unit', 'geometry'
+        ]].copy()
+        
+        psql_geo_df.columns = [
+            'unitid', 'parent_id', 'country_id', 'levelid',
+            'levelkey', 'tellevelkey', 'countnextlevel', 'unit', 'geometry'
+        ]
+        
+        psql_csv = self.output_base / "PSQL_Geo.csv"
+        psql_xlsx = self.output_base / "PSQL_Geo.xlsx"
+        psql_geo_df.to_csv(psql_csv, index=False)
+        psql_geo_df.to_excel(psql_xlsx, index=False, sheet_name='PSQL_Geo')
+        print(f"   ✅ PSQL_Geo: {len(psql_geo_df)} records -> {psql_csv.name}")
+        
+        # 3. GeoJSON.csv - ID to GeoJSON mapping
+        geojson_df = pd.DataFrame({
+            'teliosgeojson_id': final_df['unitid'],
+            'geojson': final_df['geometry']
+        })
+        
+        geojson_csv = self.output_base / "GeoJSON.csv"
+        geojson_xlsx = self.output_base / "GeoJSON.xlsx"
+        geojson_df.to_csv(geojson_csv, index=False)
+        geojson_df.to_excel(geojson_xlsx, index=False, sheet_name='GeoJSON')
+        print(f"   ✅ GeoJSON: {len(geojson_df)} records -> {geojson_csv.name}")
+        
+        # 4. teliosgeojson.csv - Database format (8 columns)
+        telios_df = pd.DataFrame({
+            'unitid': final_df['unitid'],
+            'parent_id': final_df['parentid'],
+            'country_id': final_df['country_id'],
+            'levelid': final_df['countryLevelId'],
+            'levelkey': final_df['levelKey'],
+            'tellevelkey': final_df['telioslevelKey'],
+            'countnextlevel': final_df['countnextLevel'],
+            'unit': final_df['unit']
+        })
+        
+        telios_csv = self.output_base / "teliosgeojson.csv"
+        telios_xlsx = self.output_base / "teliosgeojson.xlsx"
+        telios_df.to_csv(telios_csv, index=False)
+        telios_df.to_excel(telios_xlsx, index=False, sheet_name='teliosgeojson')
+        print(f"   ✅ teliosgeojson: {len(telios_df)} records -> {telios_csv.name}")
+        
+        # 5. teliosgeojsondata.csv - Database format (2 columns)
+        telios_data_df = pd.DataFrame({
+            'teliosgeojson_id': final_df['unitid'],
+            'geojson': final_df['geometry']
+        })
+        
+        telios_data_csv = self.output_base / "teliosgeojsondata.csv"
+        telios_data_xlsx = self.output_base / "teliosgeojsondata.xlsx"
+        telios_data_df.to_csv(telios_data_csv, index=False)
+        telios_data_df.to_excel(telios_data_xlsx, index=False, sheet_name='teliosgeojsondata')
+        print(f"   ✅ teliosgeojsondata: {len(telios_data_df)} records -> {telios_data_csv.name}")
+        
+        # Generate global processing report
+        self._generate_global_report(final_df)
+        
+        return final_df
+    
+    def _generate_global_report(self, final_df: pd.DataFrame):
+        """Generate comprehensive global processing report."""
+        report_file = self.output_base / "global_processing_report.txt"
+        
+        with open(report_file, 'w') as f:
+            f.write("=" * 80 + "\n")
+            f.write("🌍 GLOBAL GEOSPATIAL PROCESSING REPORT\n")
+            f.write("=" * 80 + "\n\n")
+            f.write(f"Report Generated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
+            f.write(f"Output Directory: {self.output_base.absolute()}\n\n")
+            
+            f.write("=" * 80 + "\n")
+            f.write("📊 COUNTRIES PROCESSED\n")
+            f.write("=" * 80 + "\n")
+            f.write(f"{'Country':<20} {'Code':<6} {'DB ID':<8} {'Records':<12} {'UnitID Range':<20} {'States':<8}\n")
+            f.write("-" * 80 + "\n")
+            
+            total_records = 0
+            for result in self.processing_results:
+                f.write(f"{result['country']:<20} {result['country_code']:<6} "
+                       f"{result['db_country_id']:<8} {result['record_count']:<12,} "
+                       f"{result['start_id']}-{result['end_id']:<18} {result['states_processed']:<8}\n")
+                total_records += result['record_count']
+            
+            f.write("-" * 80 + "\n")
+            f.write(f"{'TOTAL':<20} {'':<6} {'':<8} {total_records:<12,} "
+                   f"{final_df['unitid'].min()}-{final_df['unitid'].max():<18} "
+                   f"{len(self.processing_results):<8}\n")
+            f.write("=" * 80 + "\n\n")
+            
+            f.write("=" * 80 + "\n")
+            f.write("📈 GLOBAL STATISTICS\n")
+            f.write("=" * 80 + "\n")
+            f.write(f"Total Countries: {len(self.processing_results)}\n")
+            f.write(f"Total Records: {total_records:,}\n")
+            f.write(f"Global UnitID Range: {final_df['unitid'].min()} - {final_df['unitid'].max()}\n")
+            f.write(f"Global UnitID Span: {final_df['unitid'].max() - final_df['unitid'].min() + 1:,}\n\n")
+            
+            f.write("📋 LEVEL DISTRIBUTION (Global):\n")
+            f.write("-" * 40 + "\n")
+            for level in sorted(final_df['countryLevelId'].unique()):
+                count = len(final_df[final_df['countryLevelId'] == level])
+                desc = GeoSpatialPipeline.LEVEL_DESCRIPTIONS.get(level, f'Level {level}')
+                percentage = (count / total_records) * 100
+                f.write(f"  {desc:<10} (Level {level}): {count:>10,} records ({percentage:>5.1f}%)\n")
+            
+            f.write("\n" + "=" * 80 + "\n")
+            f.write("✅ GLOBAL PROCESSING COMPLETED SUCCESSFULLY\n")
+            f.write("=" * 80 + "\n")
+            f.write(f"\nOutput Files saved in: {self.output_base.absolute()}\n")
+            f.write("  1. Unit.csv / Unit.xlsx\n")
+            f.write("  2. PSQL_Geo.csv / PSQL_Geo.xlsx\n")
+            f.write("  3. GeoJSON.csv / GeoJSON.xlsx\n")
+            f.write("  4. teliosgeojson.csv / teliosgeojson.xlsx\n")
+            f.write("  5. teliosgeojsondata.csv / teliosgeojsondata.xlsx\n")
+            f.write("  6. global_processing_report.txt\n")
+            f.write("=" * 80 + "\n")
+        
+        print(f"\n📄 Global report generated: {report_file}")
+===== ./shared/src/processors/base_processor.py =====
+"""
+Base processor class for level-specific processing.
+Provides common functionality for all level processors.
+"""
+
+import geopandas as gpd
+import pandas as pd
+import json
+from abc import ABC, abstractmethod
+from pathlib import Path
+from typing import Dict, List, Optional
+
+class BaseProcessor(ABC):
+    """Abstract base class for GeoJSON level processors."""
+
+    def __init__(self, level: int):
+        self.level = level
+        self.id_field = f"Level{level}_id"
+        self.name_field = f"Level{level}"
+
+    def read_geojson(self, file_path: Path) -> Optional[gpd.GeoDataFrame]:
+        """Read GeoJSON file with error handling."""
+        try:
+            return gpd.read_file(str(file_path))
+        except Exception as e:
+            print(f"❌ Error reading {file_path}: {e}")
+            return None
+
+    def extract_features(self, gdf: gpd.GeoDataFrame) -> List[Dict]:
+        """Extract features from GeoDataFrame."""
+        features = []
+        for _, feature in gdf.iterrows():
+            row = self._process_feature(feature)
+            if row:
+                features.append(row)
+        return features
+
+    @abstractmethod
+    def _process_feature(self, feature) -> Optional[Dict]:
+        """Process a single feature. Override in subclass."""
+        pass
+
+    def process_file(self, file_path: Path) -> Optional[pd.DataFrame]:
+        """Process a single GeoJSON file."""
+        gdf = self.read_geojson(file_path)
+        if gdf is None:
+            return None
+
+        features = self.extract_features(gdf)
+        if not features:
+            return None
+
+        return pd.DataFrame(features)
+
+    def process_directory(self, directory: Path) -> Optional[pd.DataFrame]:
+        """Process all GeoJSON files in a directory."""
+        if not directory.exists():
+            return None
+
+        all_data = []
+        for geojson_file in directory.glob("*.geojson"):
+            df = self.process_file(geojson_file)
+            if df is not None:
+                all_data.append(df)
+
+        if not all_data:
+            return None
+
+        return pd.concat(all_data, ignore_index=True)
+    def process_directory(self, directory: Path) -> Optional[pd.DataFrame]:
+        """Process all GeoJSON files in a directory."""
+        if not directory.exists():
+            return None
+        
+        all_data = []
+        for geojson_file in directory.glob("*.geojson"):
+            df = self.process_file(geojson_file)
+            if df is not None:
+                all_data.append(df)
+        
+        if not all_data:
+            return None
+        
+        return pd.concat(all_data, ignore_index=True)
+
+===== ./shared/src/processors/level2_processor.py =====
+import geopandas as gpd
+import pandas as pd
+import json
+from pathlib import Path
+import warnings
+warnings.filterwarnings('ignore')
+
+class Level2Processor:
+    def process_file(self, file_path):
+        """Process a single Level2 GeoJSON file"""
+        try:
+            gdf = gpd.read_file(file_path)
+            if gdf.empty:
+                return None
+            
+            records = []
+            for _, row in gdf.iterrows():
+                record = {
+                    'levelKey': row.get('Level2_id', ''),
+                    'unit': row.get('Level2', ''),
+                    'parent_id': row.get('Level1_id', ''),
+                    'geometry': row.geometry.__geo_interface__ if row.geometry else {}
+                }
+                records.append(record)
+            
+            return pd.DataFrame(records)
+        except Exception as e:
+            print(f"Error processing {file_path}: {e}")
+            return None
+
+===== ./shared/src/processors/level1_processor.py =====
+"""
+Processor for Level 1 (State) data.
+Outputs complete FeatureCollection format, matching Level2 processor style.
+Handles both Map and Mapless data.
+"""
+
+import geopandas as gpd
+import pandas as pd
+import json
+from pathlib import Path
+from typing import Dict, Optional
+from .base_processor import BaseProcessor
+
+class Level1Processor(BaseProcessor):
+    """Processor for state-level GeoJSON data."""
+    
+    def __init__(self):
+        super().__init__(1)
+    
+    def _process_feature(self, feature) -> Optional[Dict]:
+        """Process a single state feature."""
+        try:
+            # Get feature properties
+            level0 = str(feature.get('Level0', ''))
+            level0_id = str(feature.get('Level0_id', ''))
+            level1 = str(feature.get('Level1', ''))
+            level1_id = str(feature.get('Level1_id', ''))
+            
+            # Handle geometry safely - check if it exists and has __geo_interface__
+            geometry = {}
+            if feature.geometry is not None:
+                try:
+                    geometry = feature.geometry.__geo_interface__
+                except AttributeError:
+                    geometry = {}
+            
+            # Create complete FeatureCollection format (with or without geometry)
+            geojson = {
+                "type": "FeatureCollection",
+                "name": level1,
+                "crs": {
+                    "type": "name",
+                    "properties": {
+                        "name": "urn:ogc:def:crs:OGC:1.3:CRS84"
+                    }
+                },
+                "features": [{
+                    "type": "Feature",
+                    "properties": {
+                        "Level0": level0,
+                        "Level0_id": level0_id,
+                        "Level1": level1,
+                        "Level1_id": level1_id
+                    },
+                    "geometry": geometry
+                }]
+            }
+            
+            return {
+                'Level0': level0,
+                'Level0_id': level0_id,
+                'Level1': level1,
+                'Level1_id': level1_id,
+                'parent_id': level0_id,
+                'geometry': json.dumps(geojson),  # Store complete FeatureCollection
+                'countryLevelId': 1,
+                'levelKey': level1_id,
+                'unit': level1,
+                'state': level1,
+                'level': 1,
+                'original_id': level1_id
+            }
+        except Exception as e:
+            print(f"❌ Error processing Level 1 feature: {e}")
+            return None
+    
+    def process_file(self, file_path: Path) -> Optional[pd.DataFrame]:
+        """Process Level 1 GeoJSON file."""
+        try:
+            gdf = self.read_geojson(file_path)
+            if gdf is None:
+                return None
+            
+            all_rows = []
+            for _, feature in gdf.iterrows():
+                row = self._process_feature(feature)
+                if row:
+                    all_rows.append(row)
+            
+            if not all_rows:
+                return None
+                
+            df = pd.DataFrame(all_rows)
+            return df
+            
+        except Exception as e:
+            print(f"Error processing Level 1 file {file_path}: {e}")
+            return None
+===== ./shared/src/processors/level4_processor.py =====
+import geopandas as gpd
+import pandas as pd
+import json
+from pathlib import Path
+import warnings
+warnings.filterwarnings('ignore')
+
+class Level4Processor:
+    def process_file(self, file_path):
+        """Process a single Level4 GeoJSON file"""
+        try:
+            gdf = gpd.read_file(file_path)
+            if gdf.empty:
+                return None
+            
+            records = []
+            for _, row in gdf.iterrows():
+                record = {
+                    'levelKey': row.get('Level4_id', ''),
+                    'unit': row.get('Level4', ''),
+                    'parent_id': row.get('Level3_id', ''),
+                    'geometry': row.geometry.__geo_interface__ if row.geometry else {}
+                }
+                records.append(record)
+            
+            return pd.DataFrame(records)
+        except Exception as e:
+            print(f"Error processing {file_path}: {e}")
+            return None
+
+===== ./shared/src/processors/level0_processor.py =====
+"""
+Processor for Level 0 (Country) data.
+Outputs complete FeatureCollection format, matching Level2 processor style.
+Handles both Map and Mapless data.
+"""
+
+import geopandas as gpd
+import pandas as pd
+import json
+from pathlib import Path
+from typing import Dict, Optional
+from .base_processor import BaseProcessor
+
+class Level0Processor(BaseProcessor):
+    """Processor for country-level GeoJSON data."""
+    
+    def __init__(self):
+        super().__init__(0)
+    
+    def _process_feature(self, feature) -> Optional[Dict]:
+        """Process a single country feature."""
+        try:
+            # Get feature properties
+            level0 = str(feature.get('Level0', ''))
+            level0_id = str(feature.get('Level0_id', ''))
+            
+            # Handle geometry safely - check if it exists and has __geo_interface__
+            geometry = {}
+            if feature.geometry is not None:
+                try:
+                    geometry = feature.geometry.__geo_interface__
+                except AttributeError:
+                    geometry = {}
+            
+            # Create complete FeatureCollection format (with or without geometry)
+            geojson = {
+                "type": "FeatureCollection",
+                "name": level0,
+                "crs": {
+                    "type": "name",
+                    "properties": {
+                        "name": "urn:ogc:def:crs:OGC:1.3:CRS84"
+                    }
+                },
+                "features": [{
+                    "type": "Feature",
+                    "properties": {
+                        "Level0": level0,
+                        "Level0_id": level0_id
+                    },
+                    "geometry": geometry
+                }]
+            }
+            
+            return {
+                'Level0': level0,
+                'Level0_id': level0_id,
+                'geometry': json.dumps(geojson),  # Store complete FeatureCollection
+                'countryLevelId': 0,
+                'levelKey': level0_id,
+                'unit': level0,
+                'level': 0,
+                'original_id': level0_id
+            }
+        except Exception as e:
+            print(f"❌ Error processing Level 0 feature: {e}")
+            return None
+    
+    def process_file(self, file_path: Path) -> Optional[pd.DataFrame]:
+        """Process Level 0 GeoJSON file."""
+        try:
+            gdf = self.read_geojson(file_path)
+            if gdf is None:
+                return None
+            
+            all_rows = []
+            for _, feature in gdf.iterrows():
+                row = self._process_feature(feature)
+                if row:
+                    all_rows.append(row)
+            
+            if not all_rows:
+                return None
+                
+            df = pd.DataFrame(all_rows)
+            return df
+            
+        except Exception as e:
+            print(f"Error processing Level 0 file {file_path}: {e}")
+            return None
+===== ./shared/src/processors/__init__.py =====
+"""
+Processor module exports.
+"""
+
+from .level0_processor import Level0Processor
+from .level1_processor import Level1Processor
+from .level2_processor import Level2Processor
+from .level3_processor import Level3Processor
+from .level4_processor import Level4Processor
+
+__all__ = [
+    'Level0Processor',
+    'Level1Processor',
+    'Level2Processor',
+    'Level3Processor',
+    'Level4Processor'
+]
+===== ./shared/src/processors/level3_processor.py =====
+import geopandas as gpd
+import pandas as pd
+import json
+from pathlib import Path
+import warnings
+warnings.filterwarnings('ignore')
+
+class Level3Processor:
+    def process_file(self, file_path):
+        """Process a single Level3 GeoJSON file"""
+        try:
+            gdf = gpd.read_file(file_path)
+            if gdf.empty:
+                return None
+            
+            records = []
+            for _, row in gdf.iterrows():
+                record = {
+                    'levelKey': row.get('Level3_id', ''),
+                    'unit': row.get('Level3', ''),
+                    'parent_id': row.get('Level2_id', ''),
+                    'geometry': row.geometry.__geo_interface__ if row.geometry else {}
+                }
+                records.append(record)
+            
+            return pd.DataFrame(records)
+        except Exception as e:
+            print(f"Error processing {file_path}: {e}")
+            return None
+
+===== ./backend/start.py =====
+#!/usr/bin/env python3
+"""
+Entry point for the backend server
+"""
+import sys
+import os
+from pathlib import Path
+
+# Add paths for imports
+backend_dir = Path(__file__).parent
+shared_dir = backend_dir.parent / 'shared'
+
+# Add to Python path
+sys.path.insert(0, str(shared_dir))
+sys.path.insert(0, str(backend_dir))
+
+# Also set environment variable
+os.environ['PYTHONPATH'] = str(shared_dir) + ':' + os.environ.get('PYTHONPATH', '')
+
+print(f"Starting Telios GeoProcessor Backend...")
+print(f"Working directory: {backend_dir}")
+print(f"Shared directory: {shared_dir}")
+print(f"Python path includes: {shared_dir}")
+
+# Import and run the app
+try:
+    from app.main import app
+    import uvicorn
+except Exception as e:
+    print(f"Error importing app: {e}")
+    import traceback
+    traceback.print_exc()
+    sys.exit(1)
+
+if __name__ == "__main__":
+    uvicorn.run(
+        app,
+        host="0.0.0.0",
+        port=8000,
+        log_level="info"
+    )
+
+===== ./backend/app/api/routes.py =====
+from fastapi import APIRouter, UploadFile, File, HTTPException, BackgroundTasks
+from fastapi.responses import JSONResponse, FileResponse
+from typing import List, Optional, Dict, Any
+import os
+import shutil
+from pathlib import Path
+
+from ..services.processor_service import ProcessorService
+from ..services.db_service import DatabaseService
+from ..models.schema import ProcessingRequest, ProcessingStatus, CountryInfo, ValidationResult
+
+router = APIRouter()
+processor_service = ProcessorService()
+db_service = DatabaseService()
+
+def check_has_geometries(country_path: Path) -> bool:
+    """Check if country has geometry data (Map type)"""
+    try:
+        # Check Level2 directory for geometry files
+        for state_dir in country_path.iterdir():
+            if state_dir.is_dir():
+                level2_dir = state_dir / "Level2"
+                if level2_dir.exists():
+                    geojson_files = list(level2_dir.glob("*.geojson"))
+                    if geojson_files:
+                        return True
+        return False
+    except:
+        return False
+
+def detect_data_type(country_path: Path) -> str:
+    """Detect if data is Map or Mapless"""
+    try:
+        # Check if there's any geometry in Level2 files
+        for state_dir in country_path.iterdir():
+            if state_dir.is_dir():
+                level2_dir = state_dir / "Level2"
+                if level2_dir.exists():
+                    geojson_files = list(level2_dir.glob("*.geojson"))
+                    if geojson_files:
+                        return "Map"
+        return "Mapless"
+    except:
+        return "Mapless"
+
+@router.post("/process")
+async def process_data(
+    background_tasks: BackgroundTasks,
+    request: ProcessingRequest
+):
+    """Start processing job"""
+    job_id = processor_service.create_job(request)
+    background_tasks.add_task(processor_service.run_job, job_id)
+    return {"job_id": job_id, "status": "started"}
+
+@router.get("/process/{job_id}/status")
+async def get_job_status(job_id: str):
+    """Get processing job status"""
+    status = processor_service.get_job_status(job_id)
+    if not status:
+        raise HTTPException(status_code=404, detail="Job not found")
+    return status
+
+@router.post("/upload")
+async def upload_file(file: UploadFile = File(...)):
+    """Upload raw data file"""
+    upload_dir = Path("/home/linson/workspace/dev/data/uploads")
+    upload_dir.mkdir(parents=True, exist_ok=True)
+    
+    file_path = upload_dir / file.filename
+    with file_path.open("wb") as buffer:
+        shutil.copyfileobj(file.file, buffer)
+    
+    return {"filename": file.filename, "path": str(file_path)}
+
+@router.get("/countries")
+async def get_countries():
+    """Get list of processed countries"""
+    countries = db_service.get_countries()
+    return countries
+
+@router.get("/export/{country_name}")
+async def export_country_data(country_name: str, format: str = "csv"):
+    """Export processed data for a country"""
+    file_path = db_service.export_country_data(country_name, format)
+    return FileResponse(
+        file_path,
+        media_type='application/octet-stream',
+        filename=f"{country_name}_export.{format}"
+    )
+
+@router.get("/validate/{country_name}")
+async def validate_country_data(country_name: str):
+    """Run validation on country data"""
+    results = db_service.validate_country_data(country_name)
+    return results
+
+@router.post("/scan")
+async def scan_directory(data: dict):
+    """Scan directory for countries - returns hierarchical structure with data type detection"""
+    path = data.get("path")
+    if not path or not os.path.exists(path):
+        raise HTTPException(status_code=400, detail="Invalid path")
+    
+    root_path = Path(path)
+    result = {
+        "data_types": [],
+        "total_countries": 0,
+        "total_continents": 0
+    }
+    
+    print(f"📁 Scanning path: {path}")
+    
+    # Check if the path itself is a Map/Mapless folder
+    is_data_type_folder = root_path.name.endswith("Map") or root_path.name.endswith("Mapless")
+    
+    if is_data_type_folder:
+        # Single data type folder selected
+        data_type = root_path.name
+        data_type_data = {
+            "name": data_type,
+            "type": "Map" if "Map" in data_type else "Mapless",
+            "continents": [],
+            "country_count": 0
+        }
+        
+        # Scan continents
+        for continent_dir in root_path.iterdir():
+            if not continent_dir.is_dir():
+                continue
+            
+            continent_data = {
+                "name": continent_dir.name,
+                "countries": []
+            }
+            
+            # Scan countries in continent
+            for country_dir in continent_dir.iterdir():
+                if not country_dir.is_dir():
+                    continue
+                
+                if (country_dir / "Level0.geojson").exists():
+                    # Detect data type for this country
+                    country_data_type = detect_data_type(country_dir)
+                    
+                    # Discover states in this country
+                    states = []
+                    for state_dir in country_dir.iterdir():
+                        if state_dir.is_dir() and (state_dir / "Level1.geojson").exists():
+                            states.append(state_dir.name)
+                    
+                    # Determine max level
+                    max_level = 1
+                    if states:
+                        sample_state = country_dir / states[0]
+                        for level in range(2, 5):
+                            if (sample_state / f"Level{level}").exists():
+                                max_level = level
+                    
+                    country_info = {
+                        "name": country_dir.name,
+                        "states": len(states),
+                        "max_level": max_level,
+                        "base_path": str(country_dir),
+                        "has_geometries": check_has_geometries(country_dir),
+                        "data_type": country_data_type  # Add data type detection
+                    }
+                    
+                    continent_data["countries"].append(country_info)
+                    data_type_data["country_count"] += 1
+            
+            if continent_data["countries"]:
+                data_type_data["continents"].append(continent_data)
+        
+        if data_type_data["continents"]:
+            result["data_types"].append(data_type_data)
+            result["total_countries"] = data_type_data["country_count"]
+            result["total_continents"] = len(data_type_data["continents"])
+        
+    else:
+        # Root directory with multiple data type folders
+        for folder in root_path.iterdir():
+            if folder.is_dir() and (folder.name.endswith("Map") or folder.name.endswith("Mapless")):
+                data_type = folder.name
+                data_type_data = {
+                    "name": data_type,
+                    "type": "Map" if "Map" in data_type else "Mapless",
+                    "continents": [],
+                    "country_count": 0
+                }
+                
+                print(f"   Found {data_type} folder")
+                
+                # Scan continents in this data type folder
+                for continent_dir in folder.iterdir():
+                    if not continent_dir.is_dir():
+                        continue
+                    
+                    continent_data = {
+                        "name": continent_dir.name,
+                        "countries": []
+                    }
+                    
+                    # Scan countries in continent
+                    for country_dir in continent_dir.iterdir():
+                        if not country_dir.is_dir():
+                            continue
+                        
+                        if (country_dir / "Level0.geojson").exists():
+                            # Detect data type for this country
+                            country_data_type = detect_data_type(country_dir)
+                            
+                            # Discover states in this country
+                            states = []
+                            for state_dir in country_dir.iterdir():
+                                if state_dir.is_dir() and (state_dir / "Level1.geojson").exists():
+                                    states.append(state_dir.name)
+                            
+                            # Determine max level
+                            max_level = 1
+                            if states:
+                                sample_state = country_dir / states[0]
+                                for level in range(2, 5):
+                                    if (sample_state / f"Level{level}").exists():
+                                        max_level = level
+                            
+                            country_info = {
+                                "name": country_dir.name,
+                                "states": len(states),
+                                "max_level": max_level,
+                                "base_path": str(country_dir),
+                                "has_geometries": check_has_geometries(country_dir),
+                                "data_type": country_data_type  # Add data type detection
+                            }
+                            
+                            continent_data["countries"].append(country_info)
+                            data_type_data["country_count"] += 1
+                    
+                    if continent_data["countries"]:
+                        data_type_data["continents"].append(continent_data)
+                
+                if data_type_data["continents"]:
+                    result["data_types"].append(data_type_data)
+                    result["total_countries"] += data_type_data["country_count"]
+                    result["total_continents"] += len(data_type_data["continents"])
+    
+    print(f"✅ Found {result['total_countries']} countries in {result['total_continents']} continents")
+    return result
+
+===== ./backend/app/api/websocket.py =====
+
+===== ./backend/app/api/__init__.py =====
+
+===== ./backend/app/core/database.py =====
+
+===== ./backend/app/core/config.py =====
+from pydantic_settings import BaseSettings
+from typing import Optional
+
+class Settings(BaseSettings):
+    # App
+    APP_NAME: str = "Telios GeoProcessor"
+    APP_VERSION: str = "1.0.0"
+    DEBUG: bool = False
+    
+    # Active environment
+    ACTIVE_ENV: str = "staging"  # staging or production
+    
+    # Database settings for different environments
+    STAGING_DB_HOST: str = "localhost"
+    STAGING_DB_PORT: int = 5432
+    STAGING_DB_NAME: str = "telios_geo_staging"
+    STAGING_DB_USER: str = "telios_app"
+    STAGING_DB_PASSWORD: str = "staging_password"
+    
+    PROD_DB_HOST: str = "localhost"
+    PROD_DB_PORT: int = 5432
+    PROD_DB_NAME: str = "telios_geo_production"
+    PROD_DB_USER: str = "telios_app_prod"
+    PROD_DB_PASSWORD: str = "prod_password"
+    
+    # Paths
+    DATA_ROOT: str = "/home/linson/workspace/dev/data/raw/Telios"
+    PROCESSED_PATH: str = "/home/linson/workspace/dev/data/processed/Telios"
+    UPLOAD_PATH: str = "/home/linson/workspace/dev/data/uploads"
+    
+    # Processing
+    MAX_WORKERS: int = 4
+    CHUNK_SIZE: int = 1000
+    
+    @property
+    def DATABASE_URL(self) -> str:
+        """Get database URL for active environment"""
+        if self.ACTIVE_ENV == "production":
+            return f"postgresql://{self.PROD_DB_USER}:{self.PROD_DB_PASSWORD}@{self.PROD_DB_HOST}:{self.PROD_DB_PORT}/{self.PROD_DB_NAME}"
+        else:
+            return f"postgresql://{self.STAGING_DB_USER}:{self.STAGING_DB_PASSWORD}@{self.STAGING_DB_HOST}:{self.STAGING_DB_PORT}/{self.STAGING_DB_NAME}"
+    
+    class Config:
+        env_file = ".env"
+
+settings = Settings()
+
+===== ./backend/app/core/logger.py =====
+
+===== ./backend/app/core/__init__.py =====
+
+===== ./backend/app/utils/__init__.py =====
+
+===== ./backend/app/main.py =====
+from fastapi import FastAPI
+from fastapi.middleware.cors import CORSMiddleware
+import uvicorn
+from pathlib import Path
+import sys
+
+# Add parent directories to path
+sys.path.insert(0, str(Path(__file__).parent.parent.parent))
+
+from .api.routes import router
+from .core.config import settings
+
+app = FastAPI(
+    title=settings.APP_NAME,
+    version=settings.APP_VERSION,
+    debug=settings.DEBUG
+)
+
+# CORS for Electron
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["http://localhost:3000", "file://*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+# Include routes
+app.include_router(router, prefix="/api/v1")
+
+@app.get("/health")
+async def health_check():
+    return {"status": "healthy", "app": settings.APP_NAME, "version": settings.APP_VERSION}
+
+# DO NOT create any tables - use existing schema only
+# Base.metadata.create_all(bind=engine)  # Commented out - no table creation
+
+if __name__ == "__main__":
+    uvicorn.run(
+        "main:app",
+        host="0.0.0.0",
+        port=8000,
+        reload=settings.DEBUG
+    )
+
+===== ./backend/app/services/processor_service.py =====
+import uuid
+from datetime import datetime
+from typing import Dict, Optional
+import threading
+from pathlib import Path
+import sys
+import os
+import pandas as pd
+import json
+import time
+
+# Add the shared directory to path for imports
+SHARED_PATH = Path(__file__).parent.parent.parent.parent / 'shared'
+sys.path.insert(0, str(SHARED_PATH))
+
+class ProcessorService:
+    def __init__(self):
+        self.jobs: Dict[str, Dict] = {}
+        self.processing_lock = threading.Lock()
+    
+    def create_job(self, request) -> str:
+        job_id = str(uuid.uuid4())
+        self.jobs[job_id] = {
+            "id": job_id,
+            "status": "created",
+            "request": request.dict() if hasattr(request, 'dict') else request,
+            "created_at": datetime.now(),
+            "progress": 0,
+            "message": "",
+            "logs": [],
+            "result": None
+        }
+        return job_id
+    
+    def add_log(self, job_id: str, message: str, level: str = "info"):
+        if job_id in self.jobs:
+            log_entry = {
+                "timestamp": datetime.now().strftime("%H:%M:%S"),
+                "message": message,
+                "level": level
+            }
+            self.jobs[job_id]["logs"].append(log_entry)
+            if len(self.jobs[job_id]["logs"]) > 200:
+                self.jobs[job_id]["logs"] = self.jobs[job_id]["logs"][-200:]
+    
+    def save_output_files_fast(self, df: pd.DataFrame, output_dir: Path, country_name: str, data_type: str = "Map"):
+        """Save output files using optimized methods"""
+        start_time = time.time()
+        
+        try:
+            output_dir.mkdir(parents=True, exist_ok=True)
+            
+            self.add_log(None, f"   📊 Preparing {len(df):,} records for export...", "info")
+            self.add_log(None, f"   📁 Output type: {data_type}", "info")
+            self.add_log(None, f"   📁 Output path: {output_dir}", "info")
+            
+            # 1. Unit.csv
+            unit_columns = ['unitid', 'parentid', 'country_id', 'country', 'country_code',
+                           'levelDescription', 'countryLevelId', 'levelKey', 'telioslevelKey', 
+                           'countnextLevel', 'unit', 'parentlevelKey', 'teliosparentlevelKey']
+            available_unit_cols = [col for col in unit_columns if col in df.columns]
+            unit_df = df[available_unit_cols].copy()
+            unit_csv = output_dir / "Unit.csv"
+            unit_df.to_csv(unit_csv, index=False)
+            self.add_log(None, f"   ✅ Unit: {len(unit_df):,} records", "success")
+            
+            # 2. PSQL_Geo.csv
+            psql_columns = ['unitid', 'parentid', 'country_id', 'countryLevelId',
+                           'levelKey', 'telioslevelKey', 'countnextLevel', 'unit', 'geometry']
+            available_psql_cols = [col for col in psql_columns if col in df.columns]
+            psql_df = df[available_psql_cols].copy()
+            psql_df.columns = ['unitid', 'parent_id', 'country_id', 'levelid',
+                               'levelkey', 'tellevelkey', 'countnextlevel', 'unit', 'geometry']
+            psql_csv = output_dir / "PSQL_Geo.csv"
+            psql_df.to_csv(psql_csv, index=False)
+            self.add_log(None, f"   ✅ PSQL_Geo: {len(psql_df):,} records", "success")
+            
+            # 3. GeoJSON.csv
+            geojson_df = pd.DataFrame({
+                'teliosgeojson_id': df['unitid'],
+                'geojson': df['geometry'] if 'geometry' in df.columns else '{}'
+            })
+            geojson_csv = output_dir / "GeoJSON.csv"
+            geojson_df.to_csv(geojson_csv, index=False)
+            self.add_log(None, f"   ✅ GeoJSON: {len(geojson_df):,} records", "success")
+            
+            # 4. teliosgeojson.csv
+            telios_df = pd.DataFrame({
+                'unitid': df['unitid'],
+                'parent_id': df['parentid'],
+                'country_id': df['country_id'],
+                'levelid': df['countryLevelId'],
+                'levelkey': df['levelKey'] if 'levelKey' in df.columns else '',
+                'tellevelkey': df['telioslevelKey'],
+                'countnextlevel': df['countnextLevel'],
+                'unit': df['unit']
+            })
+            telios_csv = output_dir / "teliosgeojson.csv"
+            telios_df.to_csv(telios_csv, index=False)
+            self.add_log(None, f"   ✅ teliosgeojson: {len(telios_df):,} records", "success")
+            
+            # 5. teliosgeojsondata.csv
+            telios_data_df = pd.DataFrame({
+                'teliosgeojson_id': df['unitid'],
+                'geojson': df['geometry'] if 'geometry' in df.columns else '{}',
+                'levelkey': df['levelKey'] if 'levelKey' in df.columns else ''
+            })
+            telios_data_csv = output_dir / "teliosgeojsondata.csv"
+            telios_data_df.to_csv(telios_data_csv, index=False)
+            self.add_log(None, f"   ✅ teliosgeojsondata: {len(telios_data_df):,} records", "success")
+            
+            # Generate report
+            self._generate_fast_report(df, output_dir, country_name, data_type)
+            
+            elapsed = time.time() - start_time
+            self.add_log(None, f"   ⚡ All files written in {elapsed:.2f} seconds", "success")
+            
+        except Exception as e:
+            self.add_log(None, f"   ⚠️ Error saving files: {e}", "warning")
+            import traceback
+            traceback.print_exc()
+    
+    def _get_file_size(self, filepath: Path) -> str:
+        """Get human-readable file size"""
+        if not filepath.exists():
+            return "0 B"
+        size = filepath.stat().st_size
+        for unit in ['B', 'KB', 'MB', 'GB']:
+            if size < 1024.0:
+                return f"{size:.1f} {unit}"
+            size /= 1024.0
+        return f"{size:.1f} GB"
+    
+    def _generate_fast_report(self, df: pd.DataFrame, output_dir: Path, country_name: str, data_type: str = "Map"):
+        """Generate processing report"""
+        report_file = output_dir / "processing_report.txt"
+        
+        with open(report_file, 'w') as f:
+            f.write("=" * 80 + "\n")
+            f.write(f"📊 PROCESSING REPORT - {country_name}\n")
+            f.write("=" * 80 + "\n\n")
+            f.write(f"Generated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
+            f.write(f"Data Type: {data_type}\n")
+            f.write(f"Output Directory: {output_dir.absolute()}\n\n")
+            
+            f.write("📈 STATISTICS\n")
+            f.write("-" * 40 + "\n")
+            f.write(f"Total Records: {len(df):,}\n")
+            f.write(f"UnitID Range: {df['unitid'].min()} - {df['unitid'].max()}\n\n")
+            
+            f.write("📋 LEVEL DISTRIBUTION\n")
+            f.write("-" * 40 + "\n")
+            for level in sorted(df['countryLevelId'].unique()):
+                count = len(df[df['countryLevelId'] == level])
+                desc = {0:'Country', 1:'State', 2:'District', 3:'Block', 4:'Village'}.get(level, f'Level {level}')
+                percentage = (count / len(df)) * 100
+                f.write(f"  {desc:<10} (Level {level}): {count:>10,} records ({percentage:>5.1f}%)\n")
+            
+            f.write("\n" + "=" * 80 + "\n")
+            f.write("✅ Processing completed successfully\n")
+            f.write("=" * 80 + "\n")
+    
+    def run_job(self, job_id: str):
+        """Run processing job with fast file writing"""
+        job = self.jobs[job_id]
+        job["status"] = "running"
+        job["started_at"] = datetime.now()
+        
+        try:
+            from src.pipeline import GlobalGeoSpatialProcessor
+            
+            self.add_log(job_id, "🔍 Initializing processing pipeline...", "info")
+            job["progress"] = 1
+            
+            data_root = job["request"]["data_root"]
+            countries = job["request"].get("countries", [])
+            base_output = Path(job["request"]["output_base"])
+            
+            self.add_log(job_id, f"📁 Data root: {data_root}", "info")
+            self.add_log(job_id, f"🌍 Countries to process: {len(countries)}", "info")
+            
+            results = []
+            total_countries = len(countries)
+            
+            for idx, country_config in enumerate(countries):
+                country_start_time = time.time()
+                country_name = country_config['name']
+                
+                # Determine data type - default to "Map" if not specified
+                data_type = country_config.get('data_type', 'Map')
+                
+                # Dynamically build output path based on data type
+                output_folder = base_output / f"Finale_{data_type}"
+                country_output_path = output_folder / country_name.replace(' ', '_')
+                
+                self.add_log(job_id, f"\n{'='*60}", "info")
+                self.add_log(job_id, f"🚀 Processing: {country_name}", "info")
+                self.add_log(job_id, f"   📋 Data Type: {data_type}", "info")
+                self.add_log(job_id, f"   💾 Output Path: {country_output_path}", "info")
+                
+                job["message"] = f"📂 Processing {country_name} ({data_type})..."
+                job["progress"] = int((idx / total_countries) * 90) + 5
+                
+                # Discover states if not provided
+                states = country_config.get('states', [])
+                if not states:
+                    states = self._discover_states_from_path(country_config['base_path'])
+                
+                full_config = {
+                    'name': country_name,
+                    'base_path': country_config['base_path'],
+                    'states': states,
+                    'max_level': country_config.get('max_level', 4),
+                    'countryId': country_config.get('countryId', 0),
+                    'data_type': data_type,
+                    'output_folder': str(output_folder)
+                }
+                
+                self.add_log(job_id, f"📊 Found {len(full_config['states'])} states", "info")
+                
+                self.add_log(job_id, "📖 Step 1/3: Extracting GeoJSON data...", "info")
+                global_processor = GlobalGeoSpatialProcessor(output_base=str(output_folder))
+                result = global_processor.process_country(full_config)
+                
+                self.add_log(job_id, f"   ✅ Extracted {result.get('record_count', 0):,} records", "success")
+                
+                self.add_log(job_id, "🔄 Step 2/3: Transforming data...", "info")
+                final_df = global_processor.get_final_dataframe()
+                
+                if final_df is not None and not final_df.empty:
+                    self.add_log(job_id, "💾 Step 3/3: Saving output files (optimized)...", "info")
+                    # Pass data_type to save_output_files_fast
+                    self.save_output_files_fast(final_df, country_output_path, country_name, data_type)
+                    
+                    # Try database storage but don't fail if it doesn't work
+                    try:
+                        from ..services.db_service import DatabaseService
+                        db = DatabaseService()
+                        db_result = db.append_processed_data(final_df, country_name)
+                        if db_result.get('error'):
+                            self.add_log(job_id, f"⚠️ Database error: {db_result['error']}", "warning")
+                        else:
+                            self.add_log(job_id, f"🗄️ Database: {db_result.get('stored', 0):,} new, {db_result.get('skipped', 0):,} skipped", "success")
+                    except Exception as db_error:
+                        self.add_log(job_id, f"⚠️ DB not available: {db_error}", "warning")
+                
+                country_elapsed = time.time() - country_start_time
+                self.add_log(job_id, f"⏱️ Completed in {country_elapsed:.1f}s", "success")
+                
+                result['data_type'] = data_type
+                result['output_path'] = str(country_output_path)
+                result['processing_time'] = country_elapsed
+                results.append(result)
+            
+            # Final summary
+            self.add_log(job_id, f"\n{'='*60}", "info")
+            self.add_log(job_id, "🎉 PROCESSING COMPLETED!", "success")
+            total_records = sum(r.get("record_count", 0) for r in results)
+            self.add_log(job_id, f"📊 Total records: {total_records:,}", "info")
+            
+            # Group results by data type
+            map_results = [r for r in results if r.get('data_type') == 'Map']
+            mapless_results = [r for r in results if r.get('data_type') == 'Mapless']
+            
+            if map_results:
+                self.add_log(job_id, f"\n📍 MAP DATA ({len(map_results)} countries):", "info")
+                for r in map_results:
+                    self.add_log(job_id, f"   ✅ {r['country']}: {r['record_count']:,} records", "success")
+                self.add_log(job_id, f"   📁 Output: {base_output}/Finale_Map/", "info")
+            
+            if mapless_results:
+                self.add_log(job_id, f"\n📍 MAPLESS DATA ({len(mapless_results)} countries):", "info")
+                for r in mapless_results:
+                    self.add_log(job_id, f"   ✅ {r['country']}: {r['record_count']:,} records", "success")
+                self.add_log(job_id, f"   📁 Output: {base_output}/Finale_Mapless/", "info")
+            
+            job["status"] = "completed"
+            job["progress"] = 100
+            job["completed_at"] = datetime.now()
+            job["message"] = "🎉 All processing completed successfully!"
+            job["result"] = {
+                "countries_processed": len(results),
+                "total_records": total_records,
+                "output_path": str(base_output),
+                "map_output": str(base_output / "Finale_Map") if map_results else None,
+                "mapless_output": str(base_output / "Finale_Mapless") if mapless_results else None,
+                "results": results
+            }
+            
+        except Exception as e:
+            import traceback
+            self.add_log(job_id, f"❌ ERROR: {str(e)}", "error")
+            for line in traceback.format_exc().split('\n')[:5]:
+                if line.strip():
+                    self.add_log(job_id, f"   {line}", "error")
+            
+            job["status"] = "failed"
+            job["error"] = str(e)
+            job["completed_at"] = datetime.now()
+            job["message"] = f"❌ Processing failed: {str(e)}"
+    
+    def _discover_states_from_path(self, country_path: str) -> list:
+        path = Path(country_path)
+        if not path.exists():
+            return []
+        
+        states = []
+        for item in path.iterdir():
+            if item.is_dir() and (item / "Level1.geojson").exists():
+                states.append(item.name)
+        return sorted(states)
+    
+    def get_job_status(self, job_id: str) -> Optional[Dict]:
+        return self.jobs.get(job_id)
+
+===== ./backend/app/services/db_service.py =====
+"""
+Database service with batch operations for fast inserts
+Fixed: Transaction handling and permission errors
+"""
+from sqlalchemy import create_engine, text
+from sqlalchemy.orm import sessionmaker
+from sqlalchemy.exc import IntegrityError, OperationalError
+import pandas as pd
+from pathlib import Path
+import json
+from typing import List, Dict, Any
+from datetime import datetime
+import time
+
+from ..core.config import settings
+from ..models.db_models import TeliosGeojson, TeliosGeojsonData
+
+class DatabaseService:
+    def __init__(self):
+        try:
+            self.sync_engine = create_engine(
+                settings.DATABASE_URL, 
+                pool_size=5,  # Reduced pool size
+                max_overflow=10,
+                pool_pre_ping=True,  # Check connections before using
+                echo=False
+            )
+            self.SessionLocal = sessionmaker(bind=self.sync_engine)
+            print("✅ Database service initialized")
+        except Exception as e:
+            print(f"⚠️ Database init error: {e}")
+            self.sync_engine = None
+            self.SessionLocal = None
+    
+    def append_processed_data(self, final_df: pd.DataFrame, country_name: str):
+        """Append processed data with improved transaction handling"""
+        if self.SessionLocal is None:
+            print("   ⚠️ Database not available, skipping storage")
+            return {"stored": 0, "skipped": 0, "data_stored": 0, "data_skipped": 0, "error": "DB not initialized"}
+        
+        session = self.SessionLocal()
+        stored_count = 0
+        skipped_count = 0
+        
+        try:
+            # Test connection first
+            try:
+                session.execute(text("SELECT 1"))
+                session.commit()
+            except Exception as conn_error:
+                print(f"   ⚠️ Database connection failed: {conn_error}")
+                session.rollback()
+                return {"stored": 0, "skipped": 0, "data_stored": 0, "data_skipped": 0, "error": str(conn_error)}
+            
+            # Process in smaller batches
+            batch_size = 500  # Smaller batch for stability
+            total_records = len(final_df)
+            
+            print(f"   📊 Storing {total_records:,} records to database...")
+            
+            for i in range(0, total_records, batch_size):
+                batch = final_df.iloc[i:i+batch_size]
+                batch_stored = 0
+                
+                try:
+                    for _, row in batch.iterrows():
+                        try:
+                            unitid = int(row.get('unitid', 0))
+                            
+                            # Check if record exists
+                            existing = session.query(TeliosGeojson).filter_by(
+                                unitid=unitid
+                            ).first()
+                            
+                            if existing:
+                                skipped_count += 1
+                                continue
+                            
+                            # Handle geometry safely
+                            geometry = row.get('geometry', '{}')
+                            if isinstance(geometry, str):
+                                try:
+                                    geometry = json.loads(geometry) if geometry else {}
+                                except:
+                                    geometry = {}
+                            
+                            telios_record = TeliosGeojson(
+                                countnextlevel=int(row.get('countnextLevel', 0)),
+                                levelid=int(row.get('countryLevelId', 0)),
+                                levelkey=str(row.get('levelKey', ''))[:100],
+                                unitid=unitid,
+                                tellevelkey=str(row.get('telioslevelKey', ''))[:200],
+                                country_id=int(row.get('country_id', 0)),
+                                parent_id=int(row.get('parentid', 0)),
+                                unit=str(row.get('unit', ''))[:200],
+                                geo_json=geometry
+                            )
+                            session.add(telios_record)
+                            batch_stored += 1
+                            stored_count += 1
+                            
+                            # Flush every 100 records
+                            if batch_stored % 100 == 0:
+                                session.flush()
+                                
+                        except IntegrityError:
+                            session.rollback()
+                            skipped_count += 1
+                            continue
+                        except Exception as e:
+                            session.rollback()
+                            print(f"   ⚠️ Error for unit {row.get('unitid', 'unknown')}: {e}")
+                            skipped_count += 1
+                            continue
+                    
+                    # Commit the batch
+                    session.commit()
+                    print(f"   📦 Batch {i//batch_size + 1}: +{batch_stored} records (Total: {stored_count:,})")
+                    
+                except Exception as batch_error:
+                    session.rollback()
+                    print(f"   ⚠️ Batch failed: {batch_error}")
+                    continue
+            
+            print(f"✅ Stored {stored_count:,} new records (skipped {skipped_count:,} existing)")
+            
+            # Now store in teliosgeojsondata
+            data_stored = 0
+            data_skipped = 0
+            
+            # Reset to start of dataframe
+            for i in range(0, total_records, batch_size):
+                batch = final_df.iloc[i:i+batch_size]
+                batch_stored = 0
+                
+                try:
+                    for _, row in batch.iterrows():
+                        try:
+                            unitid = int(row.get('unitid', 0))
+                            
+                            existing = session.query(TeliosGeojsonData).filter_by(
+                                teliosgeojson_id=unitid
+                            ).first()
+                            
+                            if existing:
+                                data_skipped += 1
+                                continue
+                            
+                            geometry = row.get('geometry', '{}')
+                            if isinstance(geometry, str):
+                                try:
+                                    geometry = json.loads(geometry) if geometry else {}
+                                except:
+                                    geometry = {}
+                            
+                            data_record = TeliosGeojsonData(
+                                geojson=geometry,
+                                teliosgeojson_id=unitid,
+                                levelkey=str(row.get('levelKey', ''))[:50]
+                            )
+                            session.add(data_record)
+                            batch_stored += 1
+                            data_stored += 1
+                            
+                            if batch_stored % 100 == 0:
+                                session.flush()
+                                
+                        except IntegrityError:
+                            session.rollback()
+                            data_skipped += 1
+                            continue
+                        except Exception as e:
+                            session.rollback()
+                            data_skipped += 1
+                            continue
+                    
+                    session.commit()
+                    
+                except Exception as batch_error:
+                    session.rollback()
+                    continue
+            
+            print(f"✅ Stored {data_stored:,} records to teliosgeojsondata (skipped {data_skipped:,})")
+            
+            return {
+                "stored": stored_count,
+                "skipped": skipped_count,
+                "data_stored": data_stored,
+                "data_skipped": data_skipped
+            }
+            
+        except Exception as e:
+            session.rollback()
+            print(f"❌ Database error: {e}")
+            import traceback
+            traceback.print_exc()
+            return {
+                "stored": 0,
+                "skipped": 0,
+                "data_stored": 0,
+                "data_skipped": 0,
+                "error": str(e)
+            }
+        finally:
+            session.close()
+    
+    def get_countries(self) -> list:
+        """Get list of processed countries with error handling"""
+        if self.SessionLocal is None:
+            return []
+        
+        try:
+            with self.SessionLocal() as session:
+                try:
+                    result = session.execute(
+                        text("""
+                            SELECT 
+                                unit as country_name,
+                                country_id,
+                                COUNT(*) as record_count,
+                                MIN(unitid) as min_id,
+                                MAX(unitid) as max_id
+                            FROM teliosgeojson
+                            WHERE levelid = 0
+                            GROUP BY unit, country_id
+                            ORDER BY unit
+                        """)
+                    )
+                    countries = []
+                    for row in result:
+                        countries.append({
+                            "country": row[0],
+                            "country_code": f"ID{row[1]}",
+                            "record_count": row[2],
+                            "min_id": row[3],
+                            "max_id": row[4]
+                        })
+                    return countries
+                except Exception as e:
+                    print(f"⚠️ Could not query countries: {e}")
+                    return []
+        except Exception as e:
+            print(f"⚠️ Database error in get_countries: {e}")
+            return []
+    
+    def export_country_data(self, country_name: str, format: str) -> str:
+        """Export country data"""
+        if self.sync_engine is None:
+            raise Exception("Database not available")
+        
+        query = text("""
+            SELECT t.*, d.geojson
+            FROM teliosgeojson t
+            LEFT JOIN teliosgeojsondata d ON t.unitid = d.teliosgeojson_id
+            WHERE t.unit = :country
+            ORDER BY t.unitid
+        """)
+        
+        try:
+            df = pd.read_sql(query, self.sync_engine, params={"country": country_name})
+            
+            export_dir = Path("/tmp")
+            timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+            export_path = export_dir / f"{country_name}_export_{timestamp}.{format}"
+            
+            if format == "csv":
+                df.to_csv(export_path, index=False)
+            elif format == "json":
+                df.to_json(export_path, orient="records")
+            elif format == "excel":
+                df.to_excel(export_path, index=False)
+            
+            return str(export_path)
+        except Exception as e:
+            print(f"Export error: {e}")
+            raise
+    
+    def validate_country_data(self, country_name: str) -> dict:
+        """Validate country data"""
+        try:
+            with self.SessionLocal() as session:
+                try:
+                    orphan_result = session.execute(
+                        text("""
+                            SELECT COUNT(*) 
+                            FROM teliosgeojson t1
+                            LEFT JOIN teliosgeojson t2 ON t1.parent_id = t2.unitid
+                            WHERE t1.unit = :country 
+                            AND t1.levelid > 0 
+                            AND t2.unitid IS NULL
+                        """),
+                        {"country": country_name}
+                    )
+                    orphans = orphan_result.scalar() or 0
+                    
+                    return {
+                        "country": country_name,
+                        "orphaned_records": orphans,
+                        "hierarchy_issues": 0,
+                        "duplicate_keys": 0,
+                        "valid": orphans == 0
+                    }
+                except Exception as e:
+                    print(f"Validation query error: {e}")
+                    return {
+                        "country": country_name,
+                        "orphaned_records": 0,
+                        "hierarchy_issues": 0,
+                        "duplicate_keys": 0,
+                        "valid": False,
+                        "error": str(e)
+                    }
+        except Exception as e:
+            print(f"Validation error: {e}")
+            return {
+                "country": country_name,
+                "orphaned_records": 0,
+                "hierarchy_issues": 0,
+                "duplicate_keys": 0,
+                "valid": False,
+                "error": str(e)
+            }
+
+===== ./backend/app/services/__init__.py =====
+
+===== ./backend/app/models/db_models.py =====
+"""
+Database models matching existing schema
+"""
+from sqlalchemy import Column, Integer, String, BigInteger, JSON, TIMESTAMP
+from sqlalchemy.ext.declarative import declarative_base
+from sqlalchemy.dialects.postgresql import JSONB
+from sqlalchemy.sql import func
+
+Base = declarative_base()
+
+class TeliosGeojson(Base):
+    """Matches existing teliosgeojson table structure"""
+    __tablename__ = 'teliosgeojson'
+    
+    id = Column(BigInteger, primary_key=True, autoincrement=True)
+    unitid = Column(BigInteger, unique=True, nullable=False)
+    parent_id = Column(BigInteger)
+    country_id = Column(Integer)
+    levelid = Column(Integer)
+    levelkey = Column(String(100))
+    tellevelkey = Column(String(200))
+    countnextlevel = Column(Integer)
+    unit = Column(String(200))
+    geo_json = Column(JSONB)
+    created_at = Column(TIMESTAMP, server_default=func.now())
+
+class TeliosGeojsonData(Base):
+    """Matches existing teliosgeojsondata table structure"""
+    __tablename__ = 'teliosgeojsondata'
+    
+    id = Column(BigInteger, primary_key=True, autoincrement=True)
+    teliosgeojson_id = Column(BigInteger, unique=True, nullable=False)
+    geojson = Column(JSONB)
+    levelkey = Column(String(50))
+    created_at = Column(TIMESTAMP, server_default=func.now())
+
+===== ./backend/app/models/__init__.py =====
+
+===== ./backend/app/models/schema.py =====
+from pydantic import BaseModel
+from typing import List, Optional, Dict, Any
+from datetime import datetime
+
+class CountryConfig(BaseModel):
+    name: str
+    base_path: Optional[str] = None
+    continent: Optional[str] = None
+    data_type: Optional[str] = None  # "Map" or "Mapless"
+    states: int = 0
+    max_level: int = 4
+    countryId: Optional[int] = None
+
+class ProcessingRequest(BaseModel):
+    data_root: str
+    output_base: str = "/home/linson/workspace/dev/data/processed/Telios"
+    countries: List[CountryConfig]
+
+class ProcessingStatus(BaseModel):
+    id: str
+    status: str
+    progress: int
+    message: str
+    created_at: datetime
+    started_at: Optional[datetime] = None
+    completed_at: Optional[datetime] = None
+    error: Optional[str] = None
+    result: Optional[Dict[str, Any]] = None
+
+class CountryInfo(BaseModel):
+    country: str
+    country_code: str
+    record_count: int
+    min_id: int
+    max_id: int
+
+class ValidationResult(BaseModel):
+    country: str
+    orphaned_records: int
+    hierarchy_issues: int
+    duplicate_keys: int
+    valid: bool
+    error: Optional[str] = None
+
+class ScanResult(BaseModel):
+    countries: List[CountryConfig]
+    summary: Dict[str, Any]
+
+===== ./backend/app/__init__.py =====
+

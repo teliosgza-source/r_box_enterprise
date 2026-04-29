@@ -1,0 +1,129 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Telios GeoProcessor</title>
+    <link rel="stylesheet" href="styles.css">
+</head>
+<body>
+    <div class="container">
+        <header>
+            <h1>🌍 Telios GeoProcessor</h1>
+            <p>Enterprise Geospatial Data Processing Suite</p>
+        </header>
+
+        <div class="main-content">
+            <!-- Left Panel - Configuration -->
+            <div class="panel config-panel">
+                <h2>Configuration</h2>
+                
+                <div class="form-group">
+                    <label for="dataRoot">Data Root Directory:</label>
+                    <input type="text" id="dataRoot" value="/home/linson/workspace/dev/data/raw/Telios">
+                    <button id="browseBtn" class="secondary">Browse</button>
+                </div>
+
+                <div class="form-group">
+                    <label for="outputBase">Output Directory:</label>
+                    <input type="text" id="outputBase" value="/home/linson/workspace/dev/data/processed/Telios">
+                    <button id="browseOutputBtn" class="secondary">Browse</button>
+                </div>
+
+                <div class="form-group">
+                    <button id="scanBtn" class="primary">🔍 Scan for Countries</button>
+                </div>
+
+                <div class="status-badge" id="scanStatus"></div>
+            </div>
+
+            <!-- Center Panel - Map and Mapless Categories -->
+            <div class="panel categories-panel">
+                <h2>Available Data</h2>
+                
+                <!-- Map Data Section -->
+                <div class="category-section">
+                    <div class="category-header">
+                        <h3>🗺️ Map Data</h3>
+                        <span class="badge" id="mapCount">0 countries</span>
+                        <div class="select-all-category">
+                            <input type="checkbox" id="selectAllMap"> Select All Map
+                        </div>
+                    </div>
+                    <div class="countries-list" id="mapCountriesList">
+                        <div class="loading">Click "Scan for Countries" to load Map data</div>
+                    </div>
+                </div>
+
+                <!-- Mapless Data Section -->
+                <div class="category-section">
+                    <div class="category-header">
+                        <h3>📄 Mapless Data</h3>
+                        <span class="badge" id="maplessCount">0 countries</span>
+                        <div class="select-all-category">
+                            <input type="checkbox" id="selectAllMapless"> Select All Mapless
+                        </div>
+                    </div>
+                    <div class="countries-list" id="maplessCountriesList">
+                        <div class="loading">Click "Scan for Countries" to load Mapless data</div>
+                    </div>
+                </div>
+            </div>
+
+            <!-- Right Panel - Processing Controls -->
+            <div class="panel process-panel">
+                <h2>Processing Controls</h2>
+                
+                <div class="selection-summary">
+                    <div class="summary-item">
+                        <span>Selected Countries:</span>
+                        <strong id="selectedCount">0</strong>
+                    </div>
+                    <div class="summary-item">
+                        <span>🗺️ Map Data:</span>
+                        <strong id="selectedMapCount">0</strong>
+                    </div>
+                    <div class="summary-item">
+                        <span>📄 Mapless Data:</span>
+                        <strong id="selectedMaplessCount">0</strong>
+                    </div>
+                </div>
+
+                <div class="form-group">
+                    <button id="processBtn" class="primary" disabled>▶ Start Processing</button>
+                </div>
+
+                <div class="progress-section" id="progressSection" style="display: none;">
+                    <h3>Processing Progress</h3>
+                    <div class="progress-bar-container">
+                        <div class="progress-bar" id="progressBar" style="width: 0%"></div>
+                    </div>
+                    <div class="progress-text" id="progressText">0%</div>
+                    <div class="status-message" id="statusMessage">Initializing...</div>
+                    <div class="current-operation" id="currentOperation"></div>
+                </div>
+
+                <div class="logs-section">
+                    <h3>Processing Logs</h3>
+                    <div class="logs-container" id="logsContainer">
+                        <div class="log-entry info">✅ Telios GeoProcessor ready</div>
+                        <div class="log-entry info">📡 Connected to backend at http://localhost:8000</div>
+                        <div class="log-entry info">📁 Default Data Root: /home/linson/workspace/dev/data/raw/Telios</div>
+                        <div class="log-entry info">💾 Default Output: /home/linson/workspace/dev/data/processed/Telios</div>
+                        <div class="log-entry info">🔍 Click "Scan for Countries" to discover Map and Mapless data</div>
+                    </div>
+                    <button id="clearLogsBtn" class="small secondary">Clear Logs</button>
+                </div>
+            </div>
+        </div>
+
+        <div class="results-section" id="resultsSection" style="display: none;">
+            <h2>Processing Results</h2>
+            <div class="results-summary" id="resultsSummary"></div>
+            <div class="results-details" id="resultsDetails"></div>
+        </div>
+    </div>
+
+    <script src="renderer.js"></script>
+</body>
+</html>

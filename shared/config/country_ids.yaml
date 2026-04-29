@@ -1,0 +1,28 @@
+country_ids:
+  Bangladesh:
+    id: 201
+    iso: BGD
+  "C\xF4te d'Ivoire":
+    id: 155
+    iso: CIV
+  India:
+    id: 204
+    iso: IND
+  Indonesia:
+    id: 205
+    iso: IDN
+  Laos:
+    id: 119
+    iso: LAO
+  Myanmar:
+    id: 151
+    iso: MMR
+  Nigeria:
+    id: 156
+    iso: NGA
+  Pakistan:
+    id: 166
+    iso: PAK
+  Uganda:
+    id: 229
+    iso: UGA

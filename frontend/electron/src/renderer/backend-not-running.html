@@ -1,0 +1,137 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <meta charset="UTF-8">
+    <title>Telios GeoProcessor - Backend Required</title>
+    <style>
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+        
+        body {
+            font-family: 'Inter', -apple-system, BlinkMacSystemFont, sans-serif;
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            height: 100vh;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+        }
+        
+        .container {
+            text-align: center;
+            background: white;
+            padding: 48px;
+            border-radius: 24px;
+            max-width: 500px;
+            margin: 20px;
+            box-shadow: 0 20px 40px rgba(0,0,0,0.1);
+        }
+        
+        .icon {
+            font-size: 64px;
+            margin-bottom: 24px;
+        }
+        
+        h1 {
+            color: #2d3748;
+            margin-bottom: 16px;
+            font-size: 28px;
+        }
+        
+        p {
+            color: #718096;
+            margin-bottom: 24px;
+            line-height: 1.6;
+        }
+        
+        .code-block {
+            background: #f7fafc;
+            padding: 16px;
+            border-radius: 8px;
+            text-align: left;
+            font-family: monospace;
+            font-size: 12px;
+            margin: 24px 0;
+            border: 1px solid #e2e8f0;
+        }
+        
+        .command {
+            background: #2d3748;
+            color: #48bb78;
+            padding: 8px;
+            border-radius: 4px;
+            font-family: monospace;
+            margin: 8px 0;
+        }
+        
+        button {
+            background: #667eea;
+            color: white;
+            border: none;
+            padding: 12px 24px;
+            border-radius: 8px;
+            font-size: 16px;
+            cursor: pointer;
+            margin-top: 16px;
+            transition: all 0.2s;
+        }
+        
+        button:hover {
+            background: #5a67d8;
+            transform: translateY(-2px);
+            box-shadow: 0 4px 12px rgba(102,126,234,0.3);
+        }
+        
+        .status {
+            display: inline-block;
+            width: 10px;
+            height: 10px;
+            border-radius: 50%;
+            background: #f56565;
+            animation: pulse 2s infinite;
+            margin-right: 8px;
+        }
+        
+        @keyframes pulse {
+            0% { opacity: 1; }
+            50% { opacity: 0.5; }
+            100% { opacity: 1; }
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <div class="icon">🚀</div>
+        <h1>Backend Not Running</h1>
+        <p>The Telios GeoProcessor backend service is not running. Please start it first:</p>
+        
+        <div class="code-block">
+            <strong>Terminal 1 - Start Backend:</strong>
+            <div class="command">cd ~/workspace/projects/web/Robin-Box-Enterprise/backend</div>
+            <div class="command">source venv/bin/activate</div>
+            <div class="command">python start.py</div>
+        </div>
+        
+        <p style="font-size: 14px; color: #a0aec0;">
+            <span class="status"></span> Waiting for backend on http://localhost:8000
+        </p>
+        
+        <button onclick="window.location.reload()">Retry Connection</button>
+    </div>
+    
+    <script>
+        // Auto-retry connection every 3 seconds
+        setInterval(() => {
+            fetch('http://localhost:8000/health')
+                .then(response => {
+                    if (response.ok) {
+                        window.location.href = 'http://localhost:3000';
+                    }
+                })
+                .catch(() => {});
+        }, 3000);
+    </script>
+</body>
+</html>
