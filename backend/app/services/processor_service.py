@@ -1,6 +1,7 @@
 """
-Processor service with fixed imports and correct method calls
+Processor service with dynamic path handling
 """
+
 import uuid
 from datetime import datetime
 from typing import Dict, Optional, List
@@ -12,27 +13,37 @@ import pandas as pd
 import json
 import time
 
-# Add the shared directory to path properly
-SHARED_PATH = Path(__file__).parent.parent.parent.parent / 'shared'
-SRC_PATH = SHARED_PATH / 'src'
+# Dynamic path configuration
+def setup_python_paths():
+    """Dynamically setup Python paths based on project structure"""
+    current_file = Path(__file__).resolve()
+    backend_dir = current_file.parent.parent.parent
+    project_root = backend_dir.parent
+    shared_dir = project_root / 'shared' / 'src'
+    
+    paths_to_add = [str(shared_dir), str(project_root), str(backend_dir)]
+    for path in paths_to_add:
+        if path not in sys.path:
+            sys.path.insert(0, path)
+    
+    os.environ['PYTHONPATH'] = ':'.join(paths_to_add) + ':' + os.environ.get('PYTHONPATH', '')
+    
+    return project_root, shared_dir
 
-# Add both to Python path
-if str(SHARED_PATH) not in sys.path:
-    sys.path.insert(0, str(SHARED_PATH))
-if str(SRC_PATH) not in sys.path:
-    sys.path.insert(0, str(SRC_PATH))
-
-# Also set environment variable
-os.environ['PYTHONPATH'] = str(SHARED_PATH) + ':' + str(SRC_PATH) + ':' + os.environ.get('PYTHONPATH', '')
-
-print(f"📚 Python paths configured:")
-print(f"   SHARED_PATH: {SHARED_PATH}")
-print(f"   SRC_PATH: {SRC_PATH}")
+PROJECT_ROOT, SHARED_DIR = setup_python_paths()
 
 class ProcessorService:
     def __init__(self):
         self.jobs: Dict[str, Dict] = {}
         self.processing_lock = threading.Lock()
+        self.project_root = PROJECT_ROOT
+        self.shared_dir = SHARED_DIR
+        
+        # Set default output directory dynamically
+        self.default_output = Path(os.getenv(
+            "TELIOS_PROCESSED_PATH",
+            Path.home() / "workspace/dev/data/processed/Telios"
+        ))
     
     def create_job(self, request) -> str:
         job_id = str(uuid.uuid4())
@@ -181,20 +192,20 @@ class ProcessorService:
         return sorted(states)
     
     def run_job(self, job_id: str):
-        """Run processing job with correct method calls"""
+        """Run processing job with dynamic imports"""
+        from src.pipeline import GlobalGeoSpatialProcessor
+        
         job = self.jobs[job_id]
         job["status"] = "running"
         job["started_at"] = datetime.now()
         
         try:
-            from src.pipeline import GlobalGeoSpatialProcessor
-            
             self.add_log(job_id, "🔍 Initializing processing pipeline...", "info")
             job["progress"] = 1
             
             data_root = job["request"].get("data_root")
             countries = job["request"].get("countries", [])
-            base_output = Path(job["request"].get("output_base", "/home/linson/workspace/dev/data/processed/Telios"))
+            base_output = Path(job["request"].get("output_base", str(self.default_output)))
             
             self.add_log(job_id, f"📁 Data root: {data_root}", "info")
             self.add_log(job_id, f"🌍 Countries to process: {len(countries)}", "info")
@@ -268,9 +279,8 @@ class ProcessorService:
                 self.add_log(job_id, "🔄 Step 2/3: Transforming data...", "info")
                 
                 # Get the final dataframe from the processor
-                # The processed data is stored in global_processor.all_country_data
                 if global_processor.all_country_data:
-                    final_df = global_processor.all_country_data[-1]  # Get the most recently processed country
+                    final_df = global_processor.all_country_data[-1]
                     
                     if final_df is not None and not final_df.empty:
                         self.add_log(job_id, "💾 Step 3/3: Saving output files (optimized)...", "info")
